@@ -462,42 +462,40 @@ class WeeklyReportAgent:
 
     # ------------------------------- Pipeline ------------------------------
     def run(self) -> None:
+    """Pipeline: localiza PDF, resume, traduce y envía (o solo informa si no hay PDF)."""
+    # 1) Buscar el último PDF
     pdf_url = self.fetch_latest_pdf_url()
     if not pdf_url:
         logging.info("No hay PDF nuevo o no se encontró ninguno.")
         return
-
     logging.info("PDF seleccionado: %s", pdf_url)
 
+    # 2) Descargar a un tmp
     import tempfile
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
-    pdf_path = tmp.name
-    tmp.close()
-    try:
-        try:
-            self.download_pdf(pdf_url, pdf_path)
-            text = self.extract_text_from_pdf(pdf_path)
-        except Exception as e:
-            logging.error("No se pudo descargar o leer el PDF: %s", e)
-            return
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        self.download_pdf(pdf_url, tmp.name)
+        pdf_path = tmp.name
 
-        summary_en = self.summarize_text(text)
-        summary_es = self.translator.translate(summary_en, dest="es")
-        html_content = self.build_html_email(summary_es, source_url=pdf_url)
+    # 3) Extraer texto y resumir
+    text = self.extract_text_from_pdf(pdf_path)
+    if not text.strip():
+        logging.warning("El PDF no tenía texto extraíble.")
+        return
 
-        if self.dry_run:
-            logging.info("DRY-RUN: no se envía email. Resumen ES (500 chars): %s", summary_es[:500])
-        else:
-            ok = self.send_email("Resumen del informe semanal", summary_es, html_body=html_content)
-            if ok:
-                logging.info("Correo enviado correctamente.")
-            else:
-                logging.warning("No se pudo enviar el correo. Revisa logs SMTP (pero el job no falla).")
-    finally:
-        try:
-            os.unlink(pdf_path)
-        except OSError:
-            pass
+    summary_en = self.summarize_text(text)
+
+    # 4) Traducir y construir HTML
+    summary_es = self.translate_to_spanish(summary_en)
+    html = self.build_html_email(summary_es)
+
+    # 5) Enviar
+    subject = "Resumen del informe semanal del ECDC"
+    if getattr(self, "dry_run", False):
+        logging.info("[DRY-RUN] No se envía email. Asunto: %s", subject)
+        return
+    self.send_email(subject, summary_es, html_body=html)
+    logging.info("Correo enviado correctamente.")
+
 
 
 
