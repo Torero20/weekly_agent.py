@@ -1,9 +1,9 @@
 name: Enviar resumen semanal del ECDC
 
 on:
-  workflow_dispatch:
-  schedule:
-    - cron: "0 8 * * 1"   # Lunes 08:00 UTC
+  workflow_dispatch:        # Botón “Run workflow”
+  push:
+    branches: [ main ]      # También se lanza cuando guardas cambios en main
 
 jobs:
   ecdc:
@@ -11,14 +11,6 @@ jobs:
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
-
-      - name: Restaurar caché de estado del agente
-        uses: actions/cache@v4
-        with:
-          path: .agent_state.json
-          key: ${{ runner.os }}-weekly-ecdc-agent-v1-${{ github.run_id }}
-          restore-keys: |
-            ${{ runner.os }}-weekly-ecdc-agent-v1-
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -33,15 +25,11 @@ jobs:
       - name: Ejecutar agente (modo prueba)
         env:
           LOG_LEVEL: INFO
-          # Secrets SMTP (tu app password de Gmail)
+          # SMTP secrets (no hacen falta en dry-run, pero los pondremos cuando envíe de verdad)
           SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
           SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
           RECEIVER_EMAIL: ${{ secrets.RECEIVER_EMAIL }}
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
-          # Opcionales (como Variables del repo si quieres)
-          BASE_URL: ${{ vars.BASE_URL }}
-          PDF_PATTERN: ${{ vars.PDF_PATTERN }}
-          SUMMARY_SENTENCES: ${{ vars.SUMMARY_SENTENCES }}
-          CA_FILE: ${{ vars.CA_FILE }}
         run: python weekly_agent.py --dry-run
+
