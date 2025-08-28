@@ -140,7 +140,7 @@ class WeeklyReportAgent:
             logging.warning("No se pudo guardar el estado: %s", e)
 
     # ------- Selección del PDF más reciente -------
-        def fetch_latest_pdf_url(self) -> Optional[str]:
+    def fetch_latest_pdf_url(self) -> Optional[str]:
         """Busca el PDF más reciente. Si la página base no enlaza PDFs directos,
         entra en las primeras noticias y busca allí."""
         def find_pdf_links(url: str) -> List[str]:
@@ -154,7 +154,7 @@ class WeeklyReportAgent:
                 # acepta .pdf aunque tenga parámetros (no exige terminar en .pdf)
                 if ".pdf" in href.lower():
                     links.append(full)
-                # por si la regex del patrón de config se usa
+                # por si quieres seguir usando el patrón configurable
                 elif re.search(self.config.pdf_pattern, href, re.IGNORECASE):
                     links.append(full)
             return links
@@ -203,7 +203,6 @@ class WeeklyReportAgent:
                 return latest
 
         return None
-
 
     # ------- Descarga, extracción, resumen -------
     def download_pdf(self, pdf_url: str, dest_path: str, max_mb: int = 25) -> None:
