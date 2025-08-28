@@ -139,93 +139,91 @@ class WeeklyReportAgent:
 
     # --------- Selección robusta del PDF (dos pasadas) ----------
     def fetch_latest_pdf_url(self) -> Optional[str]:
-        # 1) Descarga la página/índice
+        """1) Intenta encontrar PDFs directos en el listado.
+           2) Si no hay, abre páginas de detalle y busca el PDF dentro.
+        """
+        # --- Paso 1: listado ---
         r = self.session.get(self.config.base_url, timeout=30)
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
 
-        pdf_rx = re.compile(self.config.pdf_pattern, re.I)
-        inc = re.compile(getattr(self.config, "include_regex", ""), re.I) if getattr(self.config, "include_regex", "") else None
-        exc = re.compile(getattr(self.config, "exclude_regex", ""), re.I) if getattr(self.config, "exclude_regex", "") else None
+        # Intento con filtros y sin filtros en la página de listado
+        filtered = self._find_pdfs_in_soup(soup, self.config.base_url, apply_filters=True)
+        logging.debug("Candidatos en listado (con filtro): %d", len(filtered))
+        picks = filtered
+        if not picks:
+            allpdfs = self._find_pdfs_in_soup(soup, self.config.base_url, apply_filters=False)
+            logging.debug("Candidatos en listado (sin filtro): %d", len(allpdfs))
+            picks = allpdfs
 
-        def _collect(apply_filters: bool) -> List[tuple[str, dt.datetime, int]]:
-            cands: List[tuple[str, dt.datetime, int]] = []
+        # Si ya hay PDFs, elegimos el mejor
+        if picks:
+            picks.sort(key=lambda x: (x[1], x[2]), reverse=True)
+            latest_url = picks[0][0]
+            logging.debug("Elegido en listado: %s", latest_url)
+        else:
+            # --- Paso 2: recorrer páginas de detalle ---
+            logging.debug("Sin PDFs directos en el listado. Buscando en páginas de detalle...")
+            detail_links: List[tuple[str, Optional[dt.datetime]]] = []
+            seen = set()
+
             for a in soup.find_all("a", href=True):
                 href = a["href"].strip()
-                if not pdf_rx.search(href):
+                if href.lower().endswith(".pdf"):
                     continue
+                url = self._abs(href, self.config.base_url)
+                if "ecdc.europa.eu" not in url:
+                    continue
+                if url in seen:
+                    continue
+                # Heurística para quedarnos con artículos relevantes
+                txt = (a.get_text(" ", strip=True) or "") + " " + (a.parent.get_text(" ", strip=True) if a.parent else "")
+                if not re.search(r"(weekly|threat|cdtr|communicable|disease|report)", txt, re.I):
+                    continue
+                seen.add(url)
 
-                text = a.get_text(" ", strip=True)
-                parent_text = a.parent.get_text(" ", strip=True) if a.parent else ""
-                hay = f"{href} {text} {parent_text}"
-
-                if apply_filters:
-                    if inc and not inc.search(hay):
-                        continue
-                    if exc and exc.search(hay):
-                        continue
-
-                pdf_url = href if href.startswith("http") else requests.compat.urljoin(self.config.base_url, href)
-
-                # Intento de fecha por patrones conocidos
-                date_guess: Optional[dt.datetime] = None
-                for rx in [
-                    r"(\d{4}-\d{2}-\d{2})",
-                    r"(\d{1,2}\s+\w+\s+\d{4})",
-                    r"[Ww]eek\s+(\d{1,2})\s+(\d{4})",
-                ]:
-                    m = re.search(rx, hay)
+                # Estimación de fecha en el ancla
+                guessed: Optional[dt.datetime] = None
+                for rx in [r"(\d{4}-\d{2}-\d{2})", r"[Ww]eek\s+(\d{1,2})\s+(\d{4})"]:
+                    m = re.search(rx, txt)
                     if m:
                         try:
                             if len(m.groups()) == 1:
-                                for fmt in ("%Y-%m-%d", "%d %B %Y"):
-                                    try:
-                                        date_guess = dt.datetime.strptime(m.group(1), fmt)
-                                        break
-                                    except ValueError:
-                                        continue
+                                guessed = dt.datetime.strptime(m.group(1), "%Y-%m-%d")
                             else:
                                 week = int(m.group(1)); year = int(m.group(2))
-                                date_guess = dt.datetime.fromisocalendar(year, week, 1)
-                            if date_guess:
-                                break
+                                guessed = dt.datetime.fromisocalendar(year, week, 1)
+                            break
                         except Exception:
                             pass
+                detail_links.append((url, guessed))
 
-                # Fallback a Last-Modified del HEAD
-                last_mod: Optional[dt.datetime] = None
+            # Ordenamos candidatos por fecha estimada desc (None al final) y limitamos a 12
+            detail_links.sort(key=lambda x: x[1] or dt.datetime.min, reverse=True)
+            detail_links = detail_links[:12]
+            logging.debug("Páginas de detalle a inspeccionar: %d", len(detail_links))
+
+            found: List[tuple[str, dt.datetime, int]] = []
+            for url, _d in detail_links:
                 try:
-                    h = self.session.head(pdf_url, timeout=15, allow_redirects=True)
-                    if "Last-Modified" in h.headers:
-                        try:
-                            last_mod = dt.datetime.strptime(h.headers["Last-Modified"], "%a, %d %b %Y %H:%M:%S %Z")
-                        except Exception:
-                            last_mod = None
+                    rr = self.session.get(url, timeout=30)
+                    rr.raise_for_status()
                 except requests.RequestException:
-                    pass
+                    continue
+                sub = BeautifulSoup(rr.text, "html.parser")
+                # Primero con filtros; si nada, sin filtros
+                sub_picks = self._find_pdfs_in_soup(sub, url, apply_filters=True)
+                if not sub_picks:
+                    sub_picks = self._find_pdfs_in_soup(sub, url, apply_filters=False)
+                logging.debug("  %s -> PDFs encontrados: %d", url, len(sub_picks))
+                found.extend(sub_picks)
 
-                score = date_guess or last_mod or dt.datetime.min
-                bonus = 1 if re.search(r"(weekly threats|weekly\-threats|cdtr)", hay, re.I) else 0
-                cands.append((pdf_url, score, bonus))
-            return cands
+            if not found:
+                return None
 
-        # 1) Con filtros
-        filtered = _collect(apply_filters=True)
-        logging.debug("Candidatos tras filtro: %d", len(filtered))
-
-        picks = filtered
-        if not picks:
-            # 2) Sin filtros
-            allpdfs = _collect(apply_filters=False)
-            logging.debug("Candidatos sin filtro: %d", len(allpdfs))
-            picks = allpdfs
-
-        if not picks:
-            return None
-
-        picks.sort(key=lambda x: (x[1], x[2]), reverse=True)
-        latest_url = picks[0][0]
-        logging.debug("Elegido: %s", latest_url)
+            found.sort(key=lambda x: (x[1], x[2]), reverse=True)
+            latest_url = found[0][0]
+            logging.debug("Elegido en detalle: %s", latest_url)
 
         # Anti-duplicado
         st = self._load_state()
@@ -235,6 +233,7 @@ class WeeklyReportAgent:
         st["last_pdf_url"] = latest_url
         self._save_state(st)
         return latest_url
+
 
     # --------- Descarga / extracción / resumen ----------
     def download_pdf(self, pdf_url: str, dest_path: str, max_mb: int = 25) -> None:
