@@ -133,58 +133,58 @@ class WeeklyReportAgent:
 
     # ---------- Selección robusta del PDF ----------
     def fetch_latest_pdf_url(self) -> Optional[str]:
-        r = self.session.get(self.config.base_url, timeout=30)
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
+    """Busca el PDF más reciente. Hace dos pasadas:
+    1) Con filtros (preferido).
+    2) Si no hay nada, sin filtros (coge el más reciente de cualquier PDF).
+    Además, mete logs DEBUG con el número de candidatos encontrados.
+    """
+    r = self.session.get(self.config.base_url, timeout=30)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "html.parser")
 
-        inc = re.compile(self.config.include_regex, re.I) if self.config.include_regex else None
-        exc = re.compile(self.config.exclude_regex, re.I) if self.config.exclude_regex else None
-        pdf_rx = re.compile(self.config.pdf_pattern, re.I)
+    pdf_rx = re.compile(self.config.pdf_pattern, re.I)
+    inc = re.compile(getattr(self.config, "include_regex", ""), re.I) if getattr(self.config, "include_regex", "") else None
+    exc = re.compile(getattr(self.config, "exclude_regex", ""), re.I) if getattr(self.config, "exclude_regex", "") else None
 
-        candidates: List[tuple[str, dt.datetime, int]] = []  # (url, fecha_score, bonus)
-
+    def _collect(apply_filters: bool) -> List[tuple[str, dt.datetime, int]]:
+        cands: List[tuple[str, dt.datetime, int]] = []
         for a in soup.find_all("a", href=True):
             href = a["href"].strip()
             if not pdf_rx.search(href):
                 continue
 
-            # Texto para filtrar (ancla + ruta + contexto cercano)
             text = a.get_text(" ", strip=True)
             parent_text = a.parent.get_text(" ", strip=True) if a.parent else ""
             hay = f"{href} {text} {parent_text}"
-            if inc and not inc.search(hay):
-                continue
-            if exc and exc.search(hay):
-                continue
+
+            if apply_filters:
+                if inc and not inc.search(hay):
+                    continue
+                if exc and exc.search(hay):
+                    continue
 
             pdf_url = href if href.startswith("http") else requests.compat.urljoin(self.config.base_url, href)
 
-            # Intento de fecha por patrones habituales
+            # Fecha por patrones
             date_guess: Optional[dt.datetime] = None
-            for rx in [
-                r"(\d{4}-\d{2}-\d{2})",            # 2025-08-28
-                r"(\d{1,2}\s+\w+\s+\d{4})",        # 28 August 2025
-                r"[Ww]eek\s+(\d{1,2})\s+(\d{4})",  # Week 34 2025
-            ]:
+            for rx in [r"(\d{4}-\d{2}-\d{2})", r"(\d{1,2}\s+\w+\s+\d{4})", r"[Ww]eek\s+(\d{1,2})\s+(\d{4})"]:
                 m = re.search(rx, hay)
                 if m:
                     try:
                         if len(m.groups()) == 1:
                             for fmt in ("%Y-%m-%d", "%d %B %Y"):
                                 try:
-                                    date_guess = dt.datetime.strptime(m.group(1), fmt)
-                                    break
+                                    date_guess = dt.datetime.strptime(m.group(1), fmt); break
                                 except ValueError:
                                     continue
                         else:
                             week = int(m.group(1)); year = int(m.group(2))
                             date_guess = dt.datetime.fromisocalendar(year, week, 1)
-                        if date_guess:
-                            break
+                        if date_guess: break
                     except Exception:
                         pass
 
-            # Fallback a Last-Modified
+            # Fallback Last-Modified
             last_mod: Optional[dt.datetime] = None
             try:
                 h = self.session.head(pdf_url, timeout=15, allow_redirects=True)
@@ -198,22 +198,36 @@ class WeeklyReportAgent:
 
             score = date_guess or last_mod or dt.datetime.min
             bonus = 1 if re.search(r"(weekly threats|weekly\-threats|cdtr)", hay, re.I) else 0
-            candidates.append((pdf_url, score, bonus))
+            cands.append((pdf_url, score, bonus))
+        return cands
 
-        if not candidates:
-            return None
+    # 1) Con filtros
+    filtered = _collect(apply_filters=True)
+    logging.debug("Candidatos tras filtro: %d", len(filtered))
 
-        candidates.sort(key=lambda x: (x[1], x[2]), reverse=True)
-        latest_url = candidates[0][0]
+    picks = filtered
+    if not picks:
+        # 2) Sin filtros
+        allpdfs = _collect(apply_filters=False)
+        logging.debug("Candidatos sin filtro: %d", len(allpdfs))
+        picks = allpdfs
 
-        # Evitar reenvíos del mismo
-        st = self._load_state()
-        if st.get("last_pdf_url") == latest_url:
-            logging.info("Último informe ya enviado; no se reenvía.")
-            return None
-        st["last_pdf_url"] = latest_url
-        self._save_state(st)
-        return latest_url
+    if not picks:
+        return None
+
+    picks.sort(key=lambda x: (x[1], x[2]), reverse=True)
+    latest_url = picks[0][0]
+    logging.debug("Elegido: %s", latest_url)
+
+    # Anti-duplicado
+    st = self._load_state()
+    if st.get("last_pdf_url") == latest_url:
+        logging.info("Último informe ya enviado; no se reenvía.")
+        return None
+    st["last_pdf_url"] = latest_url
+    self._save_state(st)
+    return latest_url
+
 
     # ---------- Descarga, extracción y resumen ----------
     def download_pdf(self, pdf_url: str, dest_path: str, max_mb: int = 25) -> None:
