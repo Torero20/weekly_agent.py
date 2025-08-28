@@ -333,10 +333,8 @@ class WeeklyReportAgent:
 
     # ------------------- Descarga / extracción / resumen -------------------
     def download_pdf(self, pdf_url: str, dest_path: str, max_mb: int = 25) -> None:
-    """
-    Descarga el PDF comprobando que el servidor devuelve realmente un PDF.
-    Si devuelve HTML u otra cosa, reintenta con ?download=1 y falla con mensaje claro.
-    """
+        """Descarga el PDF comprobando que el servidor devuelve realmente un PDF.
+    Si devuelve HTML u otra cosa, reintenta con ?download=1 y falla con mensaje claro."""
     # Comprobación de tamaño (opcional)
     try:
         h = self.session.head(pdf_url, timeout=15, allow_redirects=True)
