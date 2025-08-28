@@ -140,62 +140,70 @@ class WeeklyReportAgent:
             logging.warning("No se pudo guardar el estado: %s", e)
 
     # ------- Selección del PDF más reciente -------
-    def fetch_latest_pdf_url(self) -> Optional[str]:
+        def fetch_latest_pdf_url(self) -> Optional[str]:
+        """Busca el PDF más reciente. Si la página base no enlaza PDFs directos,
+        entra en las primeras noticias y busca allí."""
+        def find_pdf_links(url: str) -> List[str]:
+            r = self.session.get(url, timeout=30)
+            r.raise_for_status()
+            soup = BeautifulSoup(r.text, "html.parser")
+            links: List[str] = []
+            for a in soup.find_all("a", href=True):
+                href = a["href"].strip()
+                full = href if href.startswith("http") else requests.compat.urljoin(url, href)
+                # acepta .pdf aunque tenga parámetros (no exige terminar en .pdf)
+                if ".pdf" in href.lower():
+                    links.append(full)
+                # por si la regex del patrón de config se usa
+                elif re.search(self.config.pdf_pattern, href, re.IGNORECASE):
+                    links.append(full)
+            return links
+
+        # 1) intentar encontrar PDFs en la página base
+        pdfs = find_pdf_links(self.config.base_url)
+        if pdfs:
+            latest = pdfs[-1]
+            st = self._load_state()
+            if st.get("last_pdf_url") == latest:
+                logging.info("Último informe ya enviado; no se reenvía.")
+                return None
+            st["last_pdf_url"] = latest
+            self._save_state(st)
+            return latest
+
+        # 2) si no hay PDFs directos, entrar en las primeras noticias y buscar allí
         r = self.session.get(self.config.base_url, timeout=30)
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
 
-        candidates: List[tuple[str, dt.datetime]] = []
+        detail_urls: List[str] = []
         for a in soup.find_all("a", href=True):
             href = a["href"].strip()
-            if not re.search(self.config.pdf_pattern, href, re.IGNORECASE):
+            if href.startswith("#"):
                 continue
-            pdf_url = href if href.startswith("http") else requests.compat.urljoin(self.config.base_url, href)
+            full = href if href.startswith("http") else requests.compat.urljoin(self.config.base_url, href)
+            # solo páginas del ECDC y que no sean ya PDFs
+            if "ecdc.europa.eu" in full and ".pdf" not in href.lower():
+                detail_urls.append(full)
 
-            # Intenta inferir fecha del contexto o del enlace
-            context = " ".join({
-                a.get_text(" ", strip=True),
-                (a.parent.get_text(" ", strip=True) if a.parent else "")
-            })
-            date_guess: Optional[dt.datetime] = None
-            m = re.search(r"(\d{4}-\d{2}-\d{2}|\d{1,2}\s+\w+\s+\d{4})", context)
-            if m:
-                for fmt in ("%Y-%m-%d", "%d %B %Y"):
-                    try:
-                        date_guess = dt.datetime.strptime(m.group(1), fmt)
-                        break
-                    except ValueError:
-                        continue
+        seen = set()
+        for u in detail_urls[:10]:  # prueba con las 10 primeras
+            if u in seen:
+                continue
+            seen.add(u)
+            inner_pdfs = find_pdf_links(u)
+            if inner_pdfs:
+                latest = inner_pdfs[-1]
+                st = self._load_state()
+                if st.get("last_pdf_url") == latest:
+                    logging.info("Último informe ya enviado; no se reenvía.")
+                    return None
+                st["last_pdf_url"] = latest
+                self._save_state(st)
+                return latest
 
-            # Fallback a cabecera Last-Modified
-            last_mod = None
-            try:
-                h = self.session.head(pdf_url, timeout=15, allow_redirects=True)
-                if "Last-Modified" in h.headers:
-                    try:
-                        last_mod = dt.datetime.strptime(h.headers["Last-Modified"], "%a, %d %b %Y %H:%M:%S %Z")
-                    except Exception:
-                        last_mod = None
-            except requests.RequestException:
-                pass
+        return None
 
-            score = date_guess or last_mod or dt.datetime.min
-            candidates.append((pdf_url, score))
-
-        if not candidates:
-            return None
-
-        candidates.sort(key=lambda x: x[1], reverse=True)
-        latest_url = candidates[0][0]
-
-        # Evita reenvíos si ya se procesó
-        st = self._load_state()
-        if st.get("last_pdf_url") == latest_url:
-            logging.info("Último informe ya enviado; no se reenvía.")
-            return None
-        st["last_pdf_url"] = latest_url
-        self._save_state(st)
-        return latest_url
 
     # ------- Descarga, extracción, resumen -------
     def download_pdf(self, pdf_url: str, dest_path: str, max_mb: int = 25) -> None:
