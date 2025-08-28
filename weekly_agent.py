@@ -139,37 +139,76 @@ class WeeklyReportAgent:
         except Exception as e:
             logging.warning("No se pudo guardar el estado: %s", e)
 
-    # ------- Selección del PDF más reciente -------
-    def fetch_latest_pdf_url(self) -> Optional[str]:
-        """Localiza el PDF más reciente.
-        1) Busca PDFs en la página base.
-        2) Si no hay, entra en las primeras noticias/detalles y busca dentro.
+    # ------- Extractor robusto de enlaces a PDF -------
+    def _extract_pdf_candidates(self, html_text: str, base: str) -> List[str]:
         """
-        def is_pdf_url(url: str) -> bool:
-            # True si contiene ".pdf" o si el HEAD devuelve Content-Type PDF
-            if ".pdf" in url.lower():
-                return True
+        Extrae candidatos a PDF desde:
+        - <a> (href, data-asset-url, data-file, data-href)
+        - <link>, <source>, <meta> (href/src/content)
+        - Rutas dentro de <script> como texto
+        Valida con un HEAD (Content-Type) cuando es posible.
+        """
+        soup = BeautifulSoup(html_text, "html.parser")
+        urls: set[str] = set()
+
+        def add(u: Optional[str]) -> None:
+            if not u:
+                return
+            u = u.strip()
+            full = u if u.startswith("http") else requests.compat.urljoin(base, u)
+            urls.add(full)
+
+        # Enlaces y atributos frecuentes en CMS
+        for a in soup.find_all("a"):
+            for attr in ("href", "data-asset-url", "data-file", "data-href"):
+                v = a.get(attr)
+                if not v:
+                    continue
+                if ".pdf" in v.lower() or re.search(self.config.pdf_pattern, v, re.IGNORECASE):
+                    add(v)
+
+        # Otras etiquetas que pueden contener rutas
+        for tag in soup.find_all(["link", "source", "meta"]):
+            for attr in ("href", "src", "content"):
+                v = tag.get(attr)
+                if v and ".pdf" in v.lower():
+                    add(v)
+
+        # PDFs embebidos en scripts
+        for s in soup.find_all("script"):
+            txt = (s.string or "") + (s.get_text() or "")
+            for m in re.findall(r'["\'](https?://[^"\']*?\.pdf[^"\']*)["\']|["\'](\/[^"\']*?\.pdf[^"\']*)["\']',
+                                txt, flags=re.I):
+                cand = m[0] or m[1]
+                add(cand)
+
+        # Validación ligera por cabecera
+        goods: List[str] = []
+        for u in urls:
             try:
-                h = self.session.head(url, timeout=15, allow_redirects=True)
+                h = self.session.head(u, timeout=12, allow_redirects=True)
                 ct = h.headers.get("Content-Type", "").lower()
-                return "application/pdf" in ct
+                if "pdf" in ct or u.lower().endswith(".pdf"):
+                    goods.append(u)
             except requests.RequestException:
-                return False
+                # si falla el HEAD, nos lo quedamos solo si termina en .pdf
+                if u.lower().endswith(".pdf"):
+                    goods.append(u)
+        return sorted(set(goods))
 
-        def find_pdf_links(url: str) -> List[str]:
-            r = self.session.get(url, timeout=30)
-            r.raise_for_status()
-            soup = BeautifulSoup(r.text, "html.parser")
-            links: List[str] = []
-            for a in soup.find_all("a", href=True):
-                href = a["href"].strip()
-                full = href if href.startswith("http") else requests.compat.urljoin(url, href)
-                if is_pdf_url(full) or re.search(self.config.pdf_pattern, href, re.IGNORECASE):
-                    links.append(full)
-            return links
-
-        # (1) PDFs directos en la página base
-        pdfs = find_pdf_links(self.config.base_url)
+    # ------- Localiza el PDF más reciente -------
+    def fetch_latest_pdf_url(self) -> Optional[str]:
+        """
+        1) Busca PDFs en la página base.
+        2) Si no hay, entra en las primeras páginas de detalle (publications/news)
+           y busca dentro. Amplía a 30 páginas.
+        Evita reenvíos si ya se envió el último PDF.
+        """
+        # 1) Página base
+        r = self.session.get(self.config.base_url, timeout=30)
+        r.raise_for_status()
+        base_html = r.text
+        pdfs = self._extract_pdf_candidates(base_html, self.config.base_url)
         if pdfs:
             latest = pdfs[-1]
             st = self._load_state()
@@ -180,39 +219,44 @@ class WeeklyReportAgent:
             self._save_state(st)
             return latest
 
-        # (2) Si no hay PDFs directos, entrar en las primeras páginas de detalle
-        r = self.session.get(self.config.base_url, timeout=30)
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
-
+        # 2) Explorar páginas de detalle
+        soup = BeautifulSoup(base_html, "html.parser")
         detail_urls: List[str] = []
         for a in soup.find_all("a", href=True):
             href = a["href"].strip()
             if href.startswith("#"):
                 continue
             full = href if href.startswith("http") else requests.compat.urljoin(self.config.base_url, href)
-            # solo páginas del ECDC (no PDFs ya detectados)
-            if "ecdc.europa.eu" in full and not is_pdf_url(full):
+            if "ecdc.europa.eu" not in full.lower():
+                continue
+            if ".pdf" in full.lower():
+                continue
+            # prioriza secciones típicas
+            if any(seg in full.lower() for seg in ("/publications", "/publications-data", "/news", "/news-events")):
                 detail_urls.append(full)
 
-        seen = set()
-        for u in detail_urls[:12]:  # prueba con las 12 primeras
+        seen: set[str] = set()
+        for u in detail_urls[:30]:
             if u in seen:
                 continue
             seen.add(u)
-            inner_pdfs = find_pdf_links(u)
-            if inner_pdfs:
-                latest = inner_pdfs[-1]
-                st = self._load_state()
-                if st.get("last_pdf_url") == latest:
-                    logging.info("Último informe ya enviado; no se reenvía.")
-                    return None
-                st["last_pdf_url"] = latest
-                self._save_state(st)
-                return latest
+            try:
+                rr = self.session.get(u, timeout=30)
+                rr.raise_for_status()
+                inner_pdfs = self._extract_pdf_candidates(rr.text, u)
+                if inner_pdfs:
+                    latest = inner_pdfs[-1]
+                    st = self._load_state()
+                    if st.get("last_pdf_url") == latest:
+                        logging.info("Último informe ya enviado; no se reenvía.")
+                        return None
+                    st["last_pdf_url"] = latest
+                    self._save_state(st)
+                    return latest
+            except requests.RequestException:
+                continue
 
         return None
-
 
     # ------- Descarga, extracción, resumen -------
     def download_pdf(self, pdf_url: str, dest_path: str, max_mb: int = 25) -> None:
@@ -305,9 +349,9 @@ class WeeklyReportAgent:
         </html>
         """
 
-    # ------- Envío email (SMTP por defecto) -------
+    # ------- Envío email (SMTP con app password) -------
     def send_email(self, subject: str, body: str, html_body: Optional[str] = None) -> None:
-        import smtplib, ssl
+        import smtplib
         from email.message import EmailMessage
 
         sender = self.config.sender_email
@@ -340,7 +384,7 @@ class WeeklyReportAgent:
             return
         logging.info("PDF seleccionado: %s", pdf_url)
 
-        import tempfile, os as _os
+        import tempfile
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
         pdf_path = tmp.name
         tmp.close()
@@ -357,10 +401,9 @@ class WeeklyReportAgent:
                 logging.info("Correo enviado correctamente.")
         finally:
             try:
-                _os.unlink(pdf_path)
+                os.unlink(pdf_path)
             except OSError:
                 pass
-
 
 # ---------------------- CLI ----------------------
 def build_config_from_env() -> Config:
