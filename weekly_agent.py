@@ -333,46 +333,57 @@ class WeeklyReportAgent:
 
     # ------------------- Descarga / extracción / resumen -------------------
     def download_pdf(self, pdf_url: str, dest_path: str, max_mb: int = 25) -> None:
+    """
+    Descarga el PDF comprobando que el servidor devuelve realmente un PDF.
+    Si devuelve HTML u otra cosa, reintenta con ?download=1 y falla con mensaje claro.
+    """
+    # Comprobación de tamaño (opcional)
+    try:
+        h = self.session.head(pdf_url, timeout=15, allow_redirects=True)
+        clen = h.headers.get("Content-Length")
+        if clen and int(clen) > max_mb * 1024 * 1024:
+            raise RuntimeError(f"El PDF excede {max_mb} MB ({int(clen)/1024/1024:.1f} MB)")
+    except requests.RequestException:
+        pass
+
+    headers = {"Accept": "application/pdf", "Referer": self.config.base_url}
+
+    def _download(url: str) -> requests.Response:
+        r = self.session.get(url, stream=True, timeout=60, allow_redirects=True, headers=headers)
+        r.raise_for_status()
+        return r
+
+    # 1º intento
+    r = _download(pdf_url)
+    ctype = (r.headers.get("Content-Type") or "").lower()
+
+    # Si no parece PDF, probamos con ?download=1
+    if "pdf" not in ctype:
+        alt = pdf_url + ("&download=1" if "?" in pdf_url else "?download=1")
+        logging.debug("Content-Type no es PDF (%s). Reintentando con %s", ctype or "desconocido", alt)
+        r = _download(alt)
+        ctype = (r.headers.get("Content-Type") or "").lower()
+
+    # Guardamos
+    with open(dest_path, "wb") as f:
+        for chunk in r.iter_content(chunk_size=8192):
+            if chunk:
+                f.write(chunk)
+
+    # Comprobación mágica mínima
+    try:
+        with open(dest_path, "rb") as f:
+            magic = f.read(5)
+        if magic != b"%PDF-":
+            raise RuntimeError(f"El servidor no devolvió un PDF válido (Content-Type={ctype or 'desconocido'})")
+    except Exception as e:
+        # Borramos el archivo roto para no confundir
         try:
-            h = self.session.head(pdf_url, timeout=15, allow_redirects=True)
-            clen = h.headers.get("Content-Length")
-            if clen and int(clen) > max_mb * 1024 * 1024:
-                raise RuntimeError(f"El PDF excede {max_mb} MB ({int(clen)/1024/1024:.1f} MB)")
-        except requests.RequestException:
+            os.unlink(dest_path)
+        except OSError:
             pass
+        raise
 
-        with self.session.get(pdf_url, stream=True, timeout=60) as r:
-            r.raise_for_status()
-            with open(dest_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
-
-    def extract_text_from_pdf(self, pdf_path: str) -> str:
-        try:
-            with pdfplumber.open(pdf_path) as pdf:
-                pages = [p.extract_text() or "" for p in pdf.pages]
-            txt = "\n".join(pages)
-            if len(txt.strip()) > 200:
-                return _normalize(txt)
-        except Exception:
-            pass
-        if pm_extract:
-            try:
-                txt = pm_extract(pdf_path) or ""
-                return _normalize(txt)
-            except Exception:
-                return ""
-        return ""
-
-    def summarize_text(self, text: str) -> str:
-        if not text:
-            return ""
-        snippet = text[:20000]
-        parser = PlaintextParser.from_string(snippet, Tokenizer("english"))
-        summarizer = LexRankSummarizer()
-        sentences = summarizer(parser.document, self.config.summary_sentences)
-        return " ".join(str(s) for s in sentences)
 
     # ----------------------------- Email ----------------------------------
     @staticmethod
@@ -452,38 +463,44 @@ class WeeklyReportAgent:
             return False
 
     # ------------------------------- Pipeline ------------------------------
-    def run(self) -> None:
-        pdf_url = self.fetch_latest_pdf_url()
-        if not pdf_url:
-            logging.info("No hay PDF nuevo o no se encontró ninguno.")
-            return
+       def run(self) -> None:
+    pdf_url = self.fetch_latest_pdf_url()
+    if not pdf_url:
+        logging.info("No hay PDF nuevo o no se encontró ninguno.")
+        return
 
-        logging.info("PDF seleccionado: %s", pdf_url)
+    logging.info("PDF seleccionado: %s", pdf_url)
 
-        import tempfile
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
-        pdf_path = tmp.name
-        tmp.close()
+    import tempfile
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+    pdf_path = tmp.name
+    tmp.close()
+    try:
         try:
             self.download_pdf(pdf_url, pdf_path)
             text = self.extract_text_from_pdf(pdf_path)
-            summary_en = self.summarize_text(text)
-            summary_es = self.translator.translate(summary_en, dest="es")
-            html_content = self.build_html_email(summary_es, source_url=pdf_url)
+        except Exception as e:
+            logging.error("No se pudo descargar o leer el PDF: %s", e)
+            return
 
-            if self.dry_run:
-                logging.info("DRY-RUN: no se envía email. Resumen ES (500 chars): %s", summary_es[:500])
+        summary_en = self.summarize_text(text)
+        summary_es = self.translator.translate(summary_en, dest="es")
+        html_content = self.build_html_email(summary_es, source_url=pdf_url)
+
+        if self.dry_run:
+            logging.info("DRY-RUN: no se envía email. Resumen ES (500 chars): %s", summary_es[:500])
+        else:
+            ok = self.send_email("Resumen del informe semanal", summary_es, html_body=html_content)
+            if ok:
+                logging.info("Correo enviado correctamente.")
             else:
-                ok = self.send_email("Resumen del informe semanal", summary_es, html_body=html_content)
-                if ok:
-                    logging.info("Correo enviado correctamente.")
-                else:
-                    logging.warning("No se pudo enviar el correo. Revisa logs SMTP (pero el job no falla).")
-        finally:
-            try:
-                os.unlink(pdf_path)
-            except OSError:
-                pass
+                logging.warning("No se pudo enviar el correo. Revisa logs SMTP (pero el job no falla).")
+    finally:
+        try:
+            os.unlink(pdf_path)
+        except OSError:
+            pass
+
 
 
 # ---------------------- ENV → Config (robusto a vacíos) ----------------------
