@@ -34,7 +34,7 @@ from sumy.summarizers.lex_rank import LexRankSummarizer
 def make_session() -> requests.Session:
     s = requests.Session()
     s.headers.update({
-        "User-Agent": "weekly-ecdc-agent/1.0 (+github actions)",
+        "User-Agent": "weekly-ecdc-agent/1.1 (+github actions)",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     })
     retries = Retry(total=3, backoff_factor=0.6, status_forcelist=[429, 500, 502, 503, 504])
@@ -86,8 +86,14 @@ class Config:
 
     state_path: str = os.getenv("AGENT_STATE_PATH", ".agent_state.json")
 
-    include_regex: str = r"(cdtr|communicable disease threats|weekly threats|weekly\-threats)"
+    include_regex: str = r"(cdtr|communicable[\-\s]disease[\-\s]threats|weekly[\-\s]threats)"
     exclude_regex: str = r"(annual|aer|assessment|guidance|policy|poster|infographic|annex|technical report|strategy)"
+
+    # Patrón directo de PDF semanal (plan A)
+    direct_pdf_template: str = os.getenv(
+        "DIRECT_PDF_TEMPLATE",
+        "https://www.ecdc.europa.eu/sites/default/files/documents/communicable-disease-threats-report-week-{week}-{year}.pdf",
+    )
 
 
 # --------- Auxiliares para encontrar PDFs (fuera de la clase; sin sangrías) --
@@ -196,111 +202,139 @@ class WeeklyReportAgent:
         except Exception as e:
             logging.warning("No se pudo guardar el estado: %s", e)
 
-    # ---------- Selección del PDF: listado -> detalle si hace falta ----------
+    # ---------------------- Plan A: HEAD directo por semana -------------------
+    def _try_direct_weekly_pdf(self) -> Optional[str]:
+        today = dt.date.today()
+        year, week, _ = today.isocalendar()
+        # prueba 0..6 semanas hacia atrás
+        for delta in range(0, 7):
+            w = week - delta
+            y = year
+            # cruces de año
+            if w <= 0:
+                y -= 1
+                # semana ISO 52/53
+                last_week_prev_year = dt.date(y, 12, 28).isocalendar()[1]
+                w = last_week_prev_year + w  # w es negativo o cero
+
+            url = self.config.direct_pdf_template.format(week=w, year=y)
+            try:
+                h = self.session.head(url, timeout=12, allow_redirects=True)
+                logging.debug("HEAD %s -> %s", url, h.status_code)
+                if h.status_code == 200:
+                    return url
+            except requests.RequestException:
+                continue
+        return None
+
+    # ---------- Plan B: Selección del PDF por rastreo de páginas --------------
     def fetch_latest_pdf_url(self) -> Optional[str]:
-        # 1) Listado principal
-        r = self.session.get(self.config.base_url, timeout=30)
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
-
-        # Intento en listado
-        filtered = _find_pdfs_in_soup(
-            soup, self.config.base_url, self.config.pdf_pattern,
-            self.config.include_regex, self.config.exclude_regex, self.session, apply_filters=True
-        )
-        logging.debug("Candidatos en listado (con filtro): %d", len(filtered))
-        picks = filtered
-        if not picks:
-            allpdfs = _find_pdfs_in_soup(
-                soup, self.config.base_url, self.config.pdf_pattern,
-                self.config.include_regex, self.config.exclude_regex, self.session, apply_filters=False
-            )
-            logging.debug("Candidatos en listado (sin filtro): %d", len(allpdfs))
-            picks = allpdfs
-
-        latest_url: Optional[str] = None
-        if picks:
-            picks.sort(key=lambda x: (x[1], x[2]), reverse=True)
-            latest_url = picks[0][0]
-            logging.debug("Elegido en listado: %s", latest_url)
+        # Plan A (rápido y robusto)
+        direct = self._try_direct_weekly_pdf()
+        if direct:
+            logging.debug("Plan A: encontrado por HEAD directo -> %s", direct)
+            chosen = direct
         else:
-            # 2) Páginas de detalle
-            logging.debug("Sin PDFs directos. Explorando páginas de detalle…")
-            detail_links: List[tuple[str, Optional[dt.datetime]]] = []
-            seen = set()
-            for a in soup.find_all("a", href=True):
-                href = a["href"].strip()
-                if href.lower().endswith(".pdf"):
-                    continue
-                url = _abs_url(href, self.config.base_url)
-                if "ecdc.europa.eu" not in url:
-                    continue
-                if url in seen:
-                    continue
+            # Plan B: listado + detalle
+            r = self.session.get(self.config.base_url, timeout=30)
+            r.raise_for_status()
+            soup = BeautifulSoup(r.text, "html.parser")
 
-                txt = (a.get_text(" ", strip=True) or "") + " " + (a.parent.get_text(" ", strip=True) if a.parent else "")
-                if not re.search(r"(weekly|threat|cdtr|communicable|disease|report)", txt, re.I):
-                    continue
-                seen.add(url)
-
-                guessed: Optional[dt.datetime] = None
-                for rx in [r"(\d{4}-\d{2}-\d{2})", r"[Ww]eek\s+(\d{1,2})\s+(\d{4})"]:
-                    m = re.search(rx, txt)
-                    if m:
-                        try:
-                            if len(m.groups()) == 1:
-                                guessed = dt.datetime.strptime(m.group(1), "%Y-%m-%d")
-                            else:
-                                week = int(m.group(1)); year = int(m.group(2))
-                                guessed = dt.datetime.fromisocalendar(year, week, 1)
-                            break
-                        except Exception:
-                            pass
-                detail_links.append((url, guessed))
-
-            detail_links.sort(key=lambda x: x[1] or dt.datetime.min, reverse=True)
-            detail_links = detail_links[:12]
-            logging.debug("Páginas de detalle a inspeccionar: %d", len(detail_links))
-
-            found: List[tuple[str, dt.datetime, int]] = []
-            for url, _d in detail_links:
-                try:
-                    rr = self.session.get(url, timeout=30)
-                    rr.raise_for_status()
-                except requests.RequestException:
-                    continue
-                sub = BeautifulSoup(rr.text, "html.parser")
-                sub_picks = _find_pdfs_in_soup(
-                    sub, url, self.config.pdf_pattern,
-                    self.config.include_regex, self.config.exclude_regex, self.session, apply_filters=True
+            filtered = _find_pdfs_in_soup(
+                soup, self.config.base_url, self.config.pdf_pattern,
+                self.config.include_regex, self.config.exclude_regex, self.session, apply_filters=True
+            )
+            logging.debug("Candidatos en listado (con filtro): %d", len(filtered))
+            picks = filtered
+            if not picks:
+                allpdfs = _find_pdfs_in_soup(
+                    soup, self.config.base_url, self.config.pdf_pattern,
+                    self.config.include_regex, self.config.exclude_regex, self.session, apply_filters=False
                 )
-                if not sub_picks:
+                logging.debug("Candidatos en listado (sin filtro): %d", len(allpdfs))
+                picks = allpdfs
+
+            if picks:
+                picks.sort(key=lambda x: (x[1], x[2]), reverse=True)
+                chosen = picks[0][0]
+                logging.debug("Elegido en listado: %s", chosen)
+            else:
+                logging.debug("Sin PDFs directos. Explorando páginas de detalle…")
+                detail_links: List[tuple[str, Optional[dt.datetime]]] = []
+                seen = set()
+                for a in soup.find_all("a", href=True):
+                    href = a["href"].strip()
+                    if href.lower().endswith(".pdf"):
+                        continue
+                    url = _abs_url(href, self.config.base_url)
+                    if "ecdc.europa.eu" not in url:
+                        continue
+                    if url in seen:
+                        continue
+
+                    txt = (a.get_text(" ", strip=True) or "") + " " + (a.parent.get_text(" ", strip=True) if a.parent else "")
+                    if not re.search(r"(weekly|threat|cdtr|communicable|disease|report)", txt, re.I):
+                        continue
+                    seen.add(url)
+
+                    guessed: Optional[dt.datetime] = None
+                    for rx in [r"(\d{4}-\d{2}-\d{2})", r"[Ww]eek\s+(\d{1,2})\s+(\d{4})"]:
+                        m = re.search(rx, txt)
+                        if m:
+                            try:
+                                if len(m.groups()) == 1:
+                                    guessed = dt.datetime.strptime(m.group(1), "%Y-%m-%d")
+                                else:
+                                    weekn = int(m.group(1)); yearn = int(m.group(2))
+                                    guessed = dt.datetime.fromisocalendar(yearn, weekn, 1)
+                                break
+                            except Exception:
+                                pass
+                    detail_links.append((url, guessed))
+
+                detail_links.sort(key=lambda x: x[1] or dt.datetime.min, reverse=True)
+                detail_links = detail_links[:12]
+                logging.debug("Páginas de detalle a inspeccionar: %d", len(detail_links))
+
+                found: List[tuple[str, dt.datetime, int]] = []
+                for url, _d in detail_links:
+                    try:
+                        rr = self.session.get(url, timeout=30)
+                        rr.raise_for_status()
+                    except requests.RequestException:
+                        continue
+                    sub = BeautifulSoup(rr.text, "html.parser")
                     sub_picks = _find_pdfs_in_soup(
                         sub, url, self.config.pdf_pattern,
-                        self.config.include_regex, self.config.exclude_regex, self.session, apply_filters=False
+                        self.config.include_regex, self.config.exclude_regex, self.session, apply_filters=True
                     )
-                logging.debug("  %s -> PDFs encontrados: %d", url, len(sub_picks))
-                found.extend(sub_picks)
+                    if not sub_picks:
+                        sub_picks = _find_pdfs_in_soup(
+                            sub, url, self.config.pdf_pattern,
+                            self.config.include_regex, self.config.exclude_regex, self.session, apply_filters=False
+                        )
+                    logging.debug("  %s -> PDFs encontrados: %d", url, len(sub_picks))
+                    found.extend(sub_picks)
 
-            if not found:
-                return None
-            found.sort(key=lambda x: (x[1], x[2]), reverse=True)
-            latest_url = found[0][0]
-            logging.debug("Elegido en detalle: %s", latest_url)
+                if not found:
+                    return None
+                found.sort(key=lambda x: (x[1], x[2]), reverse=True)
+                chosen = found[0][0]
+                logging.debug("Elegido en detalle: %s", chosen)
 
         # Anti-duplicado
         st = self._load_state()
-        if st.get("last_pdf_url") == latest_url:
+        if st.get("last_pdf_url") == chosen:
             logging.info("Último informe ya enviado; no se reenvía.")
             return None
-        st["last_pdf_url"] = latest_url
+        st["last_pdf_url"] = chosen
         self._save_state(st)
-        return latest_url
+        return chosen
 
     # ------------------- Descarga / extracción / resumen -------------------
     def download_pdf(self, pdf_url: str, dest_path: str, max_mb: int = 25) -> None:
         try:
-            h = self.session.head(pdf_url, timeout=20, allow_redirects=True)
+            h = self.session.head(pdf_url, timeout=15, allow_redirects=True)
             clen = h.headers.get("Content-Length")
             if clen and int(clen) > max_mb * 1024 * 1024:
                 raise RuntimeError(f"El PDF excede {max_mb} MB ({int(clen)/1024/1024:.1f} MB)")
@@ -481,6 +515,7 @@ def build_config_from_env() -> Config:
         state_path=_s("AGENT_STATE_PATH", Config.state_path),
         include_regex=_s("PDF_INCLUDE", Config.include_regex),
         exclude_regex=_s("PDF_EXCLUDE", Config.exclude_regex),
+        direct_pdf_template=_s("DIRECT_PDF_TEMPLATE", Config.direct_pdf_template),
     )
 
 
@@ -502,4 +537,3 @@ def main(argv: Optional[List[str]] = None) -> None:
 
 if __name__ == "__main__":
     main()
-
