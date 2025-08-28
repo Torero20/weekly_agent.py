@@ -76,6 +76,7 @@ def _normalize(text: str) -> str:
 
 
 # --- NLTK punkt bootstrap (para sumy) ---
+# --- NLTK punkt bootstrap (para sumy) ---
 def _ensure_punkt() -> None:
     try:
         import nltk  # type: ignore
@@ -298,15 +299,15 @@ class WeeklyReportAgent:
                 return ""
         return ""
 
-    def summarize_text(self, text: str) -> str:
-        if not text:
-            return ""
-        _ensure_punkt()
-        snippet = text[:20000]  # limita coste
-        parser = PlaintextParser.from_string(snippet, Tokenizer("english"))
-        summarizer = LexRankSummarizer()
-        sentences = summarizer(parser.document, self.config.summary_sentences)
-        return " ".join(str(s) for s in sentences)
+  def summarize_text(self, text: str) -> str:
+    if not text:
+        return ""
+    _ensure_punkt()  # asegura el tokenizador
+    snippet = text[:20000]  # limita coste
+    parser = PlaintextParser.from_string(snippet, Tokenizer("english"))
+    summarizer = LexRankSummarizer()
+    sentences = summarizer(parser.document, self.config.summary_sentences)
+    return " ".join(str(s) for s in sentences)
 
     # Email HTML
     @staticmethod
