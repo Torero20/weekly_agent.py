@@ -141,8 +141,21 @@ class WeeklyReportAgent:
 
     # ------- Selección del PDF más reciente -------
     def fetch_latest_pdf_url(self) -> Optional[str]:
-        """Busca el PDF más reciente. Si la página base no enlaza PDFs directos,
-        entra en las primeras noticias y busca allí."""
+        """Localiza el PDF más reciente.
+        1) Busca PDFs en la página base.
+        2) Si no hay, entra en las primeras noticias/detalles y busca dentro.
+        """
+        def is_pdf_url(url: str) -> bool:
+            # True si contiene ".pdf" o si el HEAD devuelve Content-Type PDF
+            if ".pdf" in url.lower():
+                return True
+            try:
+                h = self.session.head(url, timeout=15, allow_redirects=True)
+                ct = h.headers.get("Content-Type", "").lower()
+                return "application/pdf" in ct
+            except requests.RequestException:
+                return False
+
         def find_pdf_links(url: str) -> List[str]:
             r = self.session.get(url, timeout=30)
             r.raise_for_status()
@@ -151,15 +164,11 @@ class WeeklyReportAgent:
             for a in soup.find_all("a", href=True):
                 href = a["href"].strip()
                 full = href if href.startswith("http") else requests.compat.urljoin(url, href)
-                # acepta .pdf aunque tenga parámetros (no exige terminar en .pdf)
-                if ".pdf" in href.lower():
-                    links.append(full)
-                # por si quieres seguir usando el patrón configurable
-                elif re.search(self.config.pdf_pattern, href, re.IGNORECASE):
+                if is_pdf_url(full) or re.search(self.config.pdf_pattern, href, re.IGNORECASE):
                     links.append(full)
             return links
 
-        # 1) intentar encontrar PDFs en la página base
+        # (1) PDFs directos en la página base
         pdfs = find_pdf_links(self.config.base_url)
         if pdfs:
             latest = pdfs[-1]
@@ -171,7 +180,7 @@ class WeeklyReportAgent:
             self._save_state(st)
             return latest
 
-        # 2) si no hay PDFs directos, entrar en las primeras noticias y buscar allí
+        # (2) Si no hay PDFs directos, entrar en las primeras páginas de detalle
         r = self.session.get(self.config.base_url, timeout=30)
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
@@ -182,12 +191,12 @@ class WeeklyReportAgent:
             if href.startswith("#"):
                 continue
             full = href if href.startswith("http") else requests.compat.urljoin(self.config.base_url, href)
-            # solo páginas del ECDC y que no sean ya PDFs
-            if "ecdc.europa.eu" in full and ".pdf" not in href.lower():
+            # solo páginas del ECDC (no PDFs ya detectados)
+            if "ecdc.europa.eu" in full and not is_pdf_url(full):
                 detail_urls.append(full)
 
         seen = set()
-        for u in detail_urls[:10]:  # prueba con las 10 primeras
+        for u in detail_urls[:12]:  # prueba con las 12 primeras
             if u in seen:
                 continue
             seen.add(u)
@@ -203,6 +212,7 @@ class WeeklyReportAgent:
                 return latest
 
         return None
+
 
     # ------- Descarga, extracción, resumen -------
     def download_pdf(self, pdf_url: str, dest_path: str, max_mb: int = 25) -> None:
