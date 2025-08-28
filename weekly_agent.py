@@ -1,22 +1,22 @@
 """
 Weekly ECDC Agent
 -----------------
-Descarga el PDF más reciente desde la página de listados (ECDC), extrae texto,
-genera un resumen en español y lo envía por email (HTML + texto plano).
+Descarga el PDF más reciente del ECDC (lista de Weekly Threats), extrae texto,
+genera un resumen en español y lo envía por email (HTML + texto).
 
-Puntos clave:
-- Selección del PDF más reciente (fecha inferida y/o Last-Modified).
-- Evita reenvíos del mismo informe con `.agent_state.json` (y cache en Actions).
-- Extracción de texto con pdfplumber y fallback a pdfminer.six.
-- Resumen extractivo con LexRank (sumy).
-- Traducción con cliente con fallback (googletrans opcional) o desactivable.
-- Email por SMTP/SSL usando secrets (Gmail app password).
-- Logging y CLI con `--dry-run` para pruebas.
+- Selección ROBUSTA del PDF (busca en la lista y dentro de las noticias).
+- Evita duplicados con .agent_state.json (se cachea en GitHub Actions).
+- Extracción: pdfplumber -> fallback pdfminer.six.
+- Resumen: LexRank (sumy) con NLTK (auto-descarga 'punkt').
+- Traducción: googletrans (se puede desactivar).
+- Email: SMTP/SSL con contraseña de aplicación (secrets).
 
-Variables de entorno mínimas:
+ENV necesarios (en GitHub Secrets):
   SMTP_SERVER, SMTP_PORT, SENDER_EMAIL, RECEIVER_EMAIL, EMAIL_PASSWORD
-Opcionales:
-  BASE_URL, PDF_PATTERN, SUMMARY_SENTENCES, CA_FILE, LOG_LEVEL, NO_TRANSLATE, AGENT_STATE_PATH
+
+ENV opcionales (Variables del repo):
+  BASE_URL, PDF_PATTERN, SUMMARY_SENTENCES, CA_FILE, LOG_LEVEL, NO_TRANSLATE,
+  AGENT_STATE_PATH, DIRECT_PDF_URL
 """
 from __future__ import annotations
 
@@ -55,29 +55,7 @@ from sumy.parsers.plaintext import PlaintextParser
 from sumy.summarizers.lex_rank import LexRankSummarizer
 
 
-# ---------------------- Utilidades ----------------------
-class TranslatorClient:
-    """Pequeño wrapper con opción de desactivar traducción."""
-    def __init__(self) -> None:
-        self._gt = None
-        self.disabled = os.getenv("NO_TRANSLATE", "0").lower() in {"1", "true", "yes"}
-        try:
-            from googletrans import Translator as GT  # type: ignore
-            self._gt = GT()
-        except Exception:
-            self._gt = None
-
-    def translate(self, text: str, dest: str = "es") -> str:
-        if self.disabled:
-            return text
-        if self._gt:
-            try:
-                return self._gt.translate(text, dest=dest).text
-            except Exception:
-                pass
-        return text  # fallback: sin traducir
-
-
+# ---------- Utilidades ----------
 def make_session() -> requests.Session:
     s = requests.Session()
     s.headers.update({
@@ -97,11 +75,53 @@ def _normalize(text: str) -> str:
     return text
 
 
-# ---------------------- Config ----------------------
+# --- NLTK punkt bootstrap (para sumy) ---
+def _ensure_punkt() -> None:
+    try:
+        import nltk  # type: ignore
+        try:
+            nltk.data.find("tokenizers/punkt")
+        except LookupError:
+            nltk.download("punkt", quiet=True)
+        # Algunas versiones nuevas usan 'punkt_tab'
+        try:
+            nltk.data.find("tokenizers/punkt_tab")
+        except LookupError:
+            try:
+                nltk.download("punkt_tab", quiet=True)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+# Traducción con fallback
+class TranslatorClient:
+    def __init__(self) -> None:
+        self._gt = None
+        self.disabled = os.getenv("NO_TRANSLATE", "0").lower() in {"1", "true", "yes"}
+        try:
+            from googletrans import Translator as GT  # type: ignore
+            self._gt = GT()
+        except Exception:
+            self._gt = None
+
+    def translate(self, text: str, dest: str = "es") -> str:
+        if self.disabled:
+            return text
+        if self._gt:
+            try:
+                return self._gt.translate(text, dest=dest).text
+            except Exception:
+                pass
+        return text
+
+
+# ---------- Config ----------
 @dataclass
 class Config:
     base_url: str = "https://www.ecdc.europa.eu/en/publications-and-data/monitoring/weekly-threats-reports"
-    # Más tolerante: detecta ".pdf" en cualquier posición (evita perder PDFs con querystring)
+    # Permisivo: acepta .pdf en cualquier parte de la URL
     pdf_pattern: str = r"\.pdf"
     summary_sentences: int = 8
     smtp_server: str = "smtp.gmail.com"
@@ -112,7 +132,7 @@ class Config:
     state_path: str = os.getenv("AGENT_STATE_PATH", ".agent_state.json")
 
 
-# ---------------------- Agente ----------------------
+# ---------- Agente ----------
 class WeeklyReportAgent:
     def __init__(self, config: Config, translate: bool = True, dry_run: bool = False) -> None:
         self.config = config
@@ -122,7 +142,7 @@ class WeeklyReportAgent:
             self.translator.disabled = True
         self.dry_run = dry_run
 
-    # ------- Estado para evitar duplicados -------
+    # Estado para evitar duplicados
     def _load_state(self) -> dict:
         if os.path.exists(self.config.state_path):
             try:
@@ -139,15 +159,8 @@ class WeeklyReportAgent:
         except Exception as e:
             logging.warning("No se pudo guardar el estado: %s", e)
 
-    # ------- Extractor robusto de enlaces a PDF -------
+    # Extractor robusto de enlaces a PDF en HTML
     def _extract_pdf_candidates(self, html_text: str, base: str) -> List[str]:
-        """
-        Extrae candidatos a PDF desde:
-        - <a> (href, data-asset-url, data-file, data-href)
-        - <link>, <source>, <meta> (href/src/content)
-        - Rutas dentro de <script> como texto
-        Valida con un HEAD (Content-Type) cuando es posible.
-        """
         soup = BeautifulSoup(html_text, "html.parser")
         urls: set[str] = set()
 
@@ -158,7 +171,7 @@ class WeeklyReportAgent:
             full = u if u.startswith("http") else requests.compat.urljoin(base, u)
             urls.add(full)
 
-        # Enlaces y atributos frecuentes en CMS
+        # <a> y atributos frecuentes en CMS
         for a in soup.find_all("a"):
             for attr in ("href", "data-asset-url", "data-file", "data-href"):
                 v = a.get(attr)
@@ -174,7 +187,7 @@ class WeeklyReportAgent:
                 if v and ".pdf" in v.lower():
                     add(v)
 
-        # PDFs embebidos en scripts
+        # Rutas de PDF embebidas en <script>
         for s in soup.find_all("script"):
             txt = (s.string or "") + (s.get_text() or "")
             for m in re.findall(r'["\'](https?://[^"\']*?\.pdf[^"\']*)["\']|["\'](\/[^"\']*?\.pdf[^"\']*)["\']',
@@ -182,7 +195,7 @@ class WeeklyReportAgent:
                 cand = m[0] or m[1]
                 add(cand)
 
-        # Validación ligera por cabecera
+        # Validación por HEAD Content-Type (cuando se puede)
         goods: List[str] = []
         for u in urls:
             try:
@@ -191,19 +204,12 @@ class WeeklyReportAgent:
                 if "pdf" in ct or u.lower().endswith(".pdf"):
                     goods.append(u)
             except requests.RequestException:
-                # si falla el HEAD, nos lo quedamos solo si termina en .pdf
                 if u.lower().endswith(".pdf"):
                     goods.append(u)
         return sorted(set(goods))
 
-    # ------- Localiza el PDF más reciente -------
+    # Localiza el PDF más reciente (lista + páginas de detalle)
     def fetch_latest_pdf_url(self) -> Optional[str]:
-        """
-        1) Busca PDFs en la página base.
-        2) Si no hay, entra en las primeras páginas de detalle (publications/news)
-           y busca dentro. Amplía a 30 páginas.
-        Evita reenvíos si ya se envió el último PDF.
-        """
         # 1) Página base
         r = self.session.get(self.config.base_url, timeout=30)
         r.raise_for_status()
@@ -219,7 +225,7 @@ class WeeklyReportAgent:
             self._save_state(st)
             return latest
 
-        # 2) Explorar páginas de detalle
+        # 2) Explorar páginas de detalle (publications/news)
         soup = BeautifulSoup(base_html, "html.parser")
         detail_urls: List[str] = []
         for a in soup.find_all("a", href=True):
@@ -231,12 +237,11 @@ class WeeklyReportAgent:
                 continue
             if ".pdf" in full.lower():
                 continue
-            # prioriza secciones típicas
             if any(seg in full.lower() for seg in ("/publications", "/publications-data", "/news", "/news-events")):
                 detail_urls.append(full)
 
         seen: set[str] = set()
-        for u in detail_urls[:30]:
+        for u in detail_urls[:30]:  # revisa hasta 30 páginas
             if u in seen:
                 continue
             seen.add(u)
@@ -258,9 +263,8 @@ class WeeklyReportAgent:
 
         return None
 
-    # ------- Descarga, extracción, resumen -------
+    # Descarga, extracción, resumen
     def download_pdf(self, pdf_url: str, dest_path: str, max_mb: int = 25) -> None:
-        # Verifica tamaño si es posible
         try:
             h = self.session.head(pdf_url, timeout=20, allow_redirects=True)
             clen = h.headers.get("Content-Length")
@@ -277,7 +281,6 @@ class WeeklyReportAgent:
                         f.write(chunk)
 
     def extract_text_from_pdf(self, pdf_path: str) -> str:
-        # Primero pdfplumber
         try:
             with pdfplumber.open(pdf_path) as pdf:
                 pages: List[str] = []
@@ -288,7 +291,6 @@ class WeeklyReportAgent:
                 return _normalize(txt)
         except Exception:
             pass
-        # Fallback a pdfminer.six
         if pm_extract:
             try:
                 return _normalize(pm_extract(pdf_path) or "")
@@ -299,13 +301,14 @@ class WeeklyReportAgent:
     def summarize_text(self, text: str) -> str:
         if not text:
             return ""
+        _ensure_punkt()
         snippet = text[:20000]  # limita coste
         parser = PlaintextParser.from_string(snippet, Tokenizer("english"))
         summarizer = LexRankSummarizer()
         sentences = summarizer(parser.document, self.config.summary_sentences)
         return " ".join(str(s) for s in sentences)
 
-    # ------- Construcción de email -------
+    # Email HTML
     @staticmethod
     def _highlight_spain(text_escaped_html: str) -> str:
         sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text_escaped_html) if s.strip()]
@@ -349,9 +352,9 @@ class WeeklyReportAgent:
         </html>
         """
 
-    # ------- Envío email (SMTP con app password) -------
+    # Envío por SMTP (app password)
     def send_email(self, subject: str, body: str, html_body: Optional[str] = None) -> None:
-        import smtplib
+        import smtplib, ssl
         from email.message import EmailMessage
 
         sender = self.config.sender_email
@@ -376,15 +379,21 @@ class WeeklyReportAgent:
             server.login(sender, password)
             server.send_message(msg)
 
-    # ------- Pipeline -------
+    # Pipeline
     def run(self) -> None:
-        pdf_url = self.fetch_latest_pdf_url()
+        # Permite forzar un PDF concreto vía variable DIRECT_PDF_URL
+        override = os.getenv("DIRECT_PDF_URL")
+        if override and override.lower().endswith(".pdf"):
+            pdf_url = override
+        else:
+            pdf_url = self.fetch_latest_pdf_url()
+
         if not pdf_url:
             logging.info("No hay PDF nuevo o no se encontró ninguno.")
             return
         logging.info("PDF seleccionado: %s", pdf_url)
 
-        import tempfile
+        import tempfile, os as _os
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
         pdf_path = tmp.name
         tmp.close()
@@ -401,11 +410,12 @@ class WeeklyReportAgent:
                 logging.info("Correo enviado correctamente.")
         finally:
             try:
-                os.unlink(pdf_path)
+                _os.unlink(pdf_path)
             except OSError:
                 pass
 
-# ---------------------- CLI ----------------------
+
+# ---------- CLI ----------
 def build_config_from_env() -> Config:
     return Config(
         base_url=os.getenv("BASE_URL", Config.base_url),
@@ -413,8 +423,8 @@ def build_config_from_env() -> Config:
         summary_sentences=int(os.getenv("SUMMARY_SENTENCES", str(Config.summary_sentences))),
         smtp_server=os.getenv("SMTP_SERVER", Config.smtp_server),
         smtp_port=int(os.getenv("SMTP_PORT", str(Config.smtp_port))),
-        sender_email=os.getenv("SENDER_EMAIL", ""),
-        receiver_email=os.getenv("RECEIVER_EMAIL", ""),
+        sender_email=os.getenv("SENDER_EMAIL", Config.sender_email),
+        receiver_email=os.getenv("RECEIVER_EMAIL", Config.receiver_email),
         ca_file=os.getenv("CA_FILE") or None,
         state_path=os.getenv("AGENT_STATE_PATH", Config.state_path),
     )
