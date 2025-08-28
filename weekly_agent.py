@@ -462,41 +462,32 @@ class WeeklyReportAgent:
 
     # ------------------------------- Pipeline ------------------------------
     def run(self) -> None:
-    """Pipeline: localiza PDF, resume, traduce y envía (o solo informa si no hay PDF)."""
-    # 1) Buscar el último PDF
     pdf_url = self.fetch_latest_pdf_url()
     if not pdf_url:
         logging.info("No hay PDF nuevo o no se encontró ninguno.")
         return
-    logging.info("PDF seleccionado: %s", pdf_url)
 
-    # 2) Descargar a un tmp
     import tempfile
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
         self.download_pdf(pdf_url, tmp.name)
         pdf_path = tmp.name
 
-    # 3) Extraer texto y resumir
     text = self.extract_text_from_pdf(pdf_path)
     if not text.strip():
         logging.warning("El PDF no tenía texto extraíble.")
         return
 
     summary_en = self.summarize_text(text)
-
-    # 4) Traducir y construir HTML
     summary_es = self.translate_to_spanish(summary_en)
     html = self.build_html_email(summary_es)
 
-    # 5) Enviar
     subject = "Resumen del informe semanal del ECDC"
     if getattr(self, "dry_run", False):
         logging.info("[DRY-RUN] No se envía email. Asunto: %s", subject)
         return
+
     self.send_email(subject, summary_es, html_body=html)
     logging.info("Correo enviado correctamente.")
-
-
 
 
 # ---------------------- ENV → Config (robusto a vacíos) ----------------------
