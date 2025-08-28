@@ -22,15 +22,20 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Ejecutar agente (modo prueba)
-        env:
-          LOG_LEVEL: INFO
-          # SMTP secrets (no hacen falta en dry-run, pero los pondremos cuando envíe de verdad)
-          SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
-          SMTP_PORT: ${{ secrets.SMTP_PORT }}
-          SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
-          RECEIVER_EMAIL: ${{ secrets.RECEIVER_EMAIL }}
-          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+      - name: Ejecutar agente (envío real)
+         env:
+        LOG_LEVEL: INFO
+        # SMTP (usa app password)
+        SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
+        SMTP_PORT:   ${{ secrets.SMTP_PORT }}
+        SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
+        RECEIVER_EMAIL: ${{ secrets.RECEIVER_EMAIL }}
+        EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+        # Opcionales (si los creaste como Variables)
+        BASE_URL: ${{ vars.BASE_URL }}
+        PDF_PATTERN: ${{ vars.PDF_PATTERN }}
+        SUMMARY_SENTENCES: ${{ vars.SUMMARY_SENTENCES }}
       run: python weekly_agent.py
+
 
 
