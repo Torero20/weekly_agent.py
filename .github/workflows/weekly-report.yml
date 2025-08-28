@@ -22,18 +22,19 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Reset state (one-off)
+        run: rm -f .agent_state.json
+
       - name: Run agent (send email)
         env:
-          LOG_LEVEL: INFO
-          # Forzamos BASE_URL para que NUNCA esté vacía
+          LOG_LEVEL: DEBUG
           BASE_URL: https://www.ecdc.europa.eu/en/publications-and-data/monitoring/weekly-threats-reports
-          # Variables opcionales
           PDF_PATTERN: ${{ vars.PDF_PATTERN }}
           SUMMARY_SENTENCES: ${{ vars.SUMMARY_SENTENCES }}
-          # SMTP (app password)
           SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
           SMTP_PORT:   ${{ secrets.SMTP_PORT }}
           SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
           RECEIVER_EMAIL: ${{ secrets.RECEIVER_EMAIL }}
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
         run: python weekly_agent.py
+
