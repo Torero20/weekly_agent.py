@@ -462,32 +462,32 @@ class WeeklyReportAgent:
 
     # ------------------------------- Pipeline ------------------------------
     def run(self) -> None:
-    pdf_url = self.fetch_latest_pdf_url()
-    if not pdf_url:
-        logging.info("No hay PDF nuevo o no se encontró ninguno.")
-        return
+        pdf_url = self.fetch_latest_pdf_url()
+        if not pdf_url:
+            logging.info("No hay PDF nuevo o no se encontró ninguno.")
+            return
 
-    import tempfile
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-        self.download_pdf(pdf_url, tmp.name)
-        pdf_path = tmp.name
+        import tempfile
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            self.download_pdf(pdf_url, tmp.name)
+            pdf_path = tmp.name
 
-    text = self.extract_text_from_pdf(pdf_path)
-    if not text.strip():
-        logging.warning("El PDF no tenía texto extraíble.")
-        return
+        text = self.extract_text_from_pdf(pdf_path)
+        if not text.strip():
+            logging.warning("El PDF no tenía texto extraíble.")
+            return
 
-    summary_en = self.summarize_text(text)
-    summary_es = self.translate_to_spanish(summary_en)
-    html = self.build_html_email(summary_es)
+        summary_en = self.summarize_text(text)
+        summary_es = self.translate_to_spanish(summary_en)
+        html = self.build_html_email(summary_es)
 
-    subject = "Resumen del informe semanal del ECDC"
-    if getattr(self, "dry_run", False):
-        logging.info("[DRY-RUN] No se envía email. Asunto: %s", subject)
-        return
+        subject = "Resumen del informe semanal del ECDC"
+        if getattr(self, "dry_run", False):
+            logging.info("[DRY-RUN] No se envía email. Asunto: %s", subject)
+            return
 
-    self.send_email(subject, summary_es, html_body=html)
-    logging.info("Correo enviado correctamente.")
+        self.send_email(subject, summary_es, html_body=html)
+        logging.info("Correo enviado correctamente.")
 
 
 # ---------------------- ENV → Config (robusto a vacíos) ----------------------
