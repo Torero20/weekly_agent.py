@@ -376,7 +376,7 @@ class WeeklyReportAgent:
             magic = f.read(5)
         if magic != b"%PDF-":
             raise RuntimeError(f"El servidor no devolvió un PDF válido (Content-Type={ctype or 'desconocido'})")
-    except Exception as e:
+    except Exception:
         # Borramos el archivo roto para no confundir
         try:
             os.unlink(dest_path)
@@ -463,7 +463,7 @@ class WeeklyReportAgent:
             return False
 
     # ------------------------------- Pipeline ------------------------------
-       def run(self) -> None:
+    def run(self) -> None:
     pdf_url = self.fetch_latest_pdf_url()
     if not pdf_url:
         logging.info("No hay PDF nuevo o no se encontró ninguno.")
