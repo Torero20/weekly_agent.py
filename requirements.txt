@@ -3,6 +3,7 @@ beautifulsoup4
 pdfplumber
 pdfminer.six
 sumy
+numpy
+nltk
 googletrans==4.0.0-rc1
 python-dotenv
-nltk
