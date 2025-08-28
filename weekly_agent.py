@@ -133,11 +133,9 @@ class WeeklyReportAgent:
 
     # ---------- Selección robusta del PDF ----------
     def fetch_latest_pdf_url(self) -> Optional[str]:
-    """Busca el PDF más reciente. Hace dos pasadas:
-    1) Con filtros (preferido).
-    2) Si no hay nada, sin filtros (coge el más reciente de cualquier PDF).
-    Además, mete logs DEBUG con el número de candidatos encontrados.
-    """
+    # Busca el PDF más reciente con dos pasadas:
+    # 1) Con filtros include/exclude.
+    # 2) Si no hay nada, sin filtros (cualquier PDF), ordenado por fecha/Last-Modified.
     r = self.session.get(self.config.base_url, timeout=30)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
@@ -165,7 +163,7 @@ class WeeklyReportAgent:
 
             pdf_url = href if href.startswith("http") else requests.compat.urljoin(self.config.base_url, href)
 
-            # Fecha por patrones
+            # Intento de fecha por patrones conocidos
             date_guess: Optional[dt.datetime] = None
             for rx in [r"(\d{4}-\d{2}-\d{2})", r"(\d{1,2}\s+\w+\s+\d{4})", r"[Ww]eek\s+(\d{1,2})\s+(\d{4})"]:
                 m = re.search(rx, hay)
@@ -174,17 +172,19 @@ class WeeklyReportAgent:
                         if len(m.groups()) == 1:
                             for fmt in ("%Y-%m-%d", "%d %B %Y"):
                                 try:
-                                    date_guess = dt.datetime.strptime(m.group(1), fmt); break
+                                    date_guess = dt.datetime.strptime(m.group(1), fmt)
+                                    break
                                 except ValueError:
                                     continue
                         else:
                             week = int(m.group(1)); year = int(m.group(2))
                             date_guess = dt.datetime.fromisocalendar(year, week, 1)
-                        if date_guess: break
+                        if date_guess:
+                            break
                     except Exception:
                         pass
 
-            # Fallback Last-Modified
+            # Fallback a Last-Modified
             last_mod: Optional[dt.datetime] = None
             try:
                 h = self.session.head(pdf_url, timeout=15, allow_redirects=True)
@@ -227,7 +227,6 @@ class WeeklyReportAgent:
     st["last_pdf_url"] = latest_url
     self._save_state(st)
     return latest_url
-
 
     # ---------- Descarga, extracción y resumen ----------
     def download_pdf(self, pdf_url: str, dest_path: str, max_mb: int = 25) -> None:
