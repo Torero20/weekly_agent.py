@@ -138,6 +138,68 @@ class WeeklyReportAgent:
             logging.warning("No se pudo guardar el estado: %s", e)
 
     # --------- Selección robusta del PDF (dos pasadas) ----------
+        def _abs(self, href: str, base: str) -> str:
+        return href if href.startswith("http") else requests.compat.urljoin(base, href)
+
+    def _find_pdfs_in_soup(self, soup: BeautifulSoup, page_url: str, apply_filters: bool = True) -> List[tuple[str, dt.datetime, int]]:
+        """Devuelve [(pdf_url, score_dt, bonus)] encontrados en un HTML ya parseado."""
+        pdf_rx = re.compile(self.config.pdf_pattern, re.I)
+        inc = re.compile(getattr(self.config, "include_regex", ""), re.I) if getattr(self.config, "include_regex", "") else None
+        exc = re.compile(getattr(self.config, "exclude_regex", ""), re.I) if getattr(self.config, "exclude_regex", "") else None
+
+        cands: List[tuple[str, dt.datetime, int]] = []
+        for a in soup.find_all("a", href=True):
+            href = a["href"].strip()
+            if not pdf_rx.search(href):
+                continue
+
+            text = a.get_text(" ", strip=True)
+            parent_text = a.parent.get_text(" ", strip=True) if a.parent else ""
+            hay = f"{href} {text} {parent_text}"
+
+            if apply_filters:
+                if inc and not inc.search(hay):
+                    continue
+                if exc and exc.search(hay):
+                    continue
+
+            pdf_url = self._abs(href, page_url)
+
+            # Heurística de fecha (texto) + fallback Last-Modified
+            date_guess: Optional[dt.datetime] = None
+            for rx in [r"(\d{4}-\d{2}-\d{2})", r"(\d{1,2}\s+\w+\s+\d{4})", r"[Ww]eek\s+(\d{1,2})\s+(\d{4})"]:
+                m = re.search(rx, hay)
+                if m:
+                    try:
+                        if len(m.groups()) == 1:
+                            for fmt in ("%Y-%m-%d", "%d %B %Y"):
+                                try:
+                                    date_guess = dt.datetime.strptime(m.group(1), fmt); break
+                                except ValueError:
+                                    continue
+                        else:
+                            week = int(m.group(1)); year = int(m.group(2))
+                            date_guess = dt.datetime.fromisocalendar(year, week, 1)
+                        if date_guess: break
+                    except Exception:
+                        pass
+
+            last_mod: Optional[dt.datetime] = None
+            try:
+                h = self.session.head(pdf_url, timeout=15, allow_redirects=True)
+                if "Last-Modified" in h.headers:
+                    try:
+                        last_mod = dt.datetime.strptime(h.headers["Last-Modified"], "%a, %d %b %Y %H:%M:%S %Z")
+                    except Exception:
+                        last_mod = None
+            except requests.RequestException:
+                pass
+
+            score = date_guess or last_mod or dt.datetime.min
+            bonus = 1 if re.search(r"(weekly threats|weekly\-threats|cdtr)", hay, re.I) else 0
+            cands.append((pdf_url, score, bonus))
+        return cands
+
     def fetch_latest_pdf_url(self) -> Optional[str]:
         """1) Intenta encontrar PDFs directos en el listado.
            2) Si no hay, abre páginas de detalle y busca el PDF dentro.
