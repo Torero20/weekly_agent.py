@@ -217,58 +217,71 @@ class WeeklyReportAgent:
 
     # --------------------- Descarga / extracción -----------------------
 
-    def download_pdf(self, pdf_url: str, dest_path: str, max_mb: int = 25) -> None:
-        """
-        Descarga el PDF tras comprobar tipo y tamaño (si el servidor lo informa).
-        """
-        # Comprobación de tamaño (opcional)
+        def download_pdf(self, pdf_url: str, dest_path: str, max_mb: int = 25) -> None:
+            """Descarga el PDF verificando tipo y cabecera real. Si el servidor devuelve HTML,
+            reintenta automáticamente con ?download=1 (ECDC lo exige a veces)."""
+        def _append_download_param(url: str) -> str:
+            return url + ("&download=1" if "?" in url else "?download=1")
+
+        def _looks_like_pdf(first_bytes: bytes) -> bool:
+            # Un PDF real empieza por %PDF
+            return first_bytes.startswith(b"%PDF")
+
+        # 1) HEAD opcional: tamaño
         try:
             h = self.session.head(pdf_url, timeout=15, allow_redirects=True)
             clen = h.headers.get("Content-Length")
-            if clen:
-                if int(clen) > max_mb * 1024 * 1024:
-                    raise RuntimeError(
-                        f"El PDF excede {max_mb} MB ({int(clen)/1024/1024:.1f} MB)"
-                    )
+            if clen and int(clen) > max_mb * 1024 * 1024:
+                raise RuntimeError(
+                    f"El PDF excede {max_mb} MB ({int(clen)/1024/1024:.1f} MB)"
+                )
         except requests.RequestException:
             pass
 
         headers = {
             "Accept": "application/pdf",
             "Referer": self.config.base_url,
+            "Cache-Control": "no-cache",
         }
-        # GET con streaming
-        with self.session.get(pdf_url, headers=headers, stream=True, timeout=30) as r:
+
+        def _try_get(url: str) -> Tuple[str, Optional[str], bytes]:
+            r = self.session.get(url, headers=headers, stream=True, timeout=45, allow_redirects=True)
             r.raise_for_status()
+            ct = r.headers.get("Content-Type", "")
+            # Leemos los primeros bytes para validar firma %PDF
+            chunk_iter = r.iter_content(chunk_size=8192)
+            first = next(chunk_iter, b"")
+            # Escribimos a disco
             with open(dest_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=8192):
+                if first:
+                    f.write(first)
+                for chunk in chunk_iter:
                     if chunk:
                         f.write(chunk)
+            return ct, r.headers.get("Content-Length"), first
 
-    def extract_text(self, pdf_path: str) -> str:
-        """
-        Preferimos pdfplumber; si falla, intentamos pdfminer.six.
-        """
+        # 2) Primer intento tal cual
         try:
-            with pdfplumber.open(pdf_path) as pdf:
-                parts: List[str] = []
-                for page in pdf.pages:
-                    t = page.extract_text() or ""
-                    if t.strip():
-                        parts.append(t)
-                txt = "\n".join(parts).strip()
-                if txt:
-                    return txt
-        except Exception:
-            pass
+            ct, clen, first = _try_get(pdf_url)
+            logging.debug("GET %s -> Content-Type=%s, len=%s", pdf_url, ct, clen)
+            if ("pdf" in (ct or "").lower()) and _looks_like_pdf(first):
+                return
+            logging.info("Respuesta no-PDF. Reintentando con ?download=1 ...")
+        except requests.RequestException as e:
+            logging.info("Fallo en GET inicial (%s). Reintentamos con ?download=1 ...", e)
 
-        if pm_extract is not None:
-            try:
-                return (pm_extract(pdf_path) or "").strip()
-            except Exception:
-                pass
+        # 3) Segundo intento con ?download=1
+            retry_url = _append_download_param(pdf_url)
+            ct2, clen2, first2 = _try_get(retry_url)
+            logging.debug("GET %s -> Content-Type=%s, len=%s", retry_url, ct2, clen2)
+            if ("pdf" in (ct2 or "").lower()) and _looks_like_pdf(first2):
+            return
 
-        return ""
+        # 4) Si seguimos sin PDF, error con diagnóstico
+            raise RuntimeError(
+            f"No se obtuvo un PDF válido (Content-Type={ct2!r}, firma={first2[:8]!r})."
+        )
+
 
     # -------------------------- Sumario --------------------------------
 
