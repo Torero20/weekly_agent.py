@@ -127,7 +127,7 @@ def _find_pdfs_in_soup(
 
         pdf_url = _abs_url(href, page_url)
 
-        # Fecha por patrones + fallback Last-Modified
+        # Fecha por patrones + fallback Last-Modified (HEAD)
         date_guess: Optional[dt.datetime] = None
         for rx in [r"(\d{4}-\d{2}-\d{2})", r"(\d{1,2}\s+\w+\s+\d{4})", r"[Ww]eek\s+(\d{1,2})\s+(\d{4})"]:
             m = re.search(rx, hay)
@@ -172,6 +172,8 @@ class WeeklyReportAgent:
     def __init__(self, config: Config, translate: bool = True, dry_run: bool = False) -> None:
         self.config = config
         self.session = make_session()
+        # IMPORTANTE: algunos sitios exigen Referer para descargar
+        self.session.headers["Referer"] = self.config.base_url
         self.translator = TranslatorClient()
         if not translate:
             self.translator.disabled = True
@@ -382,31 +384,38 @@ class WeeklyReportAgent:
         </html>
         """
 
-    def send_email(self, subject: str, body: str, html_body: Optional[str] = None) -> None:
+    def send_email(self, subject: str, body: str, html_body: Optional[str] = None) -> bool:
+        """Devuelve True si el envío fue bien, False si algo falló (y lo deja en logs)."""
         import smtplib
         from email.message import EmailMessage
-
         sender = self.config.sender_email
         receiver = self.config.receiver_email
         if not sender or not receiver:
-            raise ValueError("Debes definir SENDER_EMAIL y RECEIVER_EMAIL")
+            logging.error("SENDER_EMAIL/RECEIVER_EMAIL no definidos.")
+            return False
 
         password = os.getenv("EMAIL_PASSWORD")
         if not password:
-            raise ValueError("EMAIL_PASSWORD no definido (SMTP)")
+            logging.error("EMAIL_PASSWORD no definido. No se puede enviar por SMTP.")
+            return False
 
-        msg = EmailMessage()
-        msg["Subject"] = subject
-        msg["From"] = sender
-        msg["To"] = receiver
-        msg.set_content(body or "(Sin texto)")
-        if html_body:
-            msg.add_alternative(html_body, subtype="html")
+        try:
+            msg = EmailMessage()
+            msg["Subject"] = subject
+            msg["From"] = sender
+            msg["To"] = receiver
+            msg.set_content(body or "(Sin texto)")
+            if html_body:
+                msg.add_alternative(html_body, subtype="html")
 
-        context = ssl.create_default_context(cafile=self.config.ca_file) if self.config.ca_file else ssl.create_default_context()
-        with smtplib.SMTP_SSL(self.config.smtp_server, self.config.smtp_port, context=context) as server:
-            server.login(sender, password)
-            server.send_message(msg)
+            context = ssl.create_default_context(cafile=self.config.ca_file) if self.config.ca_file else ssl.create_default_context()
+            with smtplib.SMTP_SSL(self.config.smtp_server, self.config.smtp_port, context=context) as server:
+                server.login(sender, password)
+                server.send_message(msg)
+            return True
+        except Exception as e:
+            logging.exception("Fallo enviando email: %s", e)
+            return False
 
     # ------------------------------- Pipeline ------------------------------
     def run(self) -> None:
@@ -414,6 +423,7 @@ class WeeklyReportAgent:
         if not pdf_url:
             logging.info("No hay PDF nuevo o no se encontró ninguno.")
             return
+
         logging.info("PDF seleccionado: %s", pdf_url)
 
         import tempfile
@@ -426,11 +436,15 @@ class WeeklyReportAgent:
             summary_en = self.summarize_text(text)
             summary_es = self.translator.translate(summary_en, dest="es")
             html_content = self.build_html_email(summary_es, source_url=pdf_url)
+
             if self.dry_run:
                 logging.info("DRY-RUN: no se envía email. Resumen ES (500 chars): %s", summary_es[:500])
             else:
-                self.send_email("Resumen del informe semanal", summary_es, html_body=html_content)
-                logging.info("Correo enviado correctamente.")
+                ok = self.send_email("Resumen del informe semanal", summary_es, html_body=html_content)
+                if ok:
+                    logging.info("Correo enviado correctamente.")
+                else:
+                    logging.warning("No se pudo enviar el correo. Revisa logs SMTP (pero el job no falla).")
         finally:
             try:
                 os.unlink(pdf_path)
@@ -488,3 +502,4 @@ def main(argv: Optional[List[str]] = None) -> None:
 
 if __name__ == "__main__":
     main()
+
