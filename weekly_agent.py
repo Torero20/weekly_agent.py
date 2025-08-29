@@ -252,13 +252,17 @@ class WeeklyReportAgent:
             chunk_iter = r.iter_content(chunk_size=8192)
             first = next(chunk_iter, b"")
             # Escribimos a disco
-            with open(dest_path, "wb") as f:
-                if first:
-                    f.write(first)
-                    for chunk in chunk_iter:
-                    if chunk:
-                        f.write(chunk)
-            return ct, r.headers.get("Content-Length"), first
+            # Escribimos a disco
+with open(dest_path, "wb") as f:
+    if first:
+        f.write(first)
+    for chunk in chunk_iter:
+        if not chunk:
+            continue
+        f.write(chunk)
+
+return ct, r.headers.get("Content-Length"), first
+
 
         # 2) Primer intento tal cual
         try:
