@@ -218,31 +218,16 @@ class WeeklyReportAgent:
     # --------------------- Descarga / extracción -----------------------
 
     def download_pdf(self, pdf_url: str, dest_path: str, max_mb: int = 25) -> None:
-        """Descarga el PDF verificando tipo y cabecera real. Si el servidor devuelve HTML,
-        reintenta automáticamente con ?download=1 (ECDC lo exige a veces)."""
+        """
+        Descarga el PDF verificando tipo y cabecera real. Si el servidor devuelve HTML,
+        reintenta automáticamente con ?download=1 (ECDC lo exige a veces).
+        """
         def _append_download_param(url: str) -> str:
             return url + ("&download=1" if "?" in url else "?download=1")
 
         def _looks_like_pdf(first_bytes: bytes) -> bool:
             # Un PDF real empieza por %PDF
             return first_bytes.startswith(b"%PDF")
-
-        def _try_get(url: str) -> Tuple[str, Optional[str], bytes]:
-            r = self.session.get(url, headers=headers, stream=True, timeout=45, allow_redirects=True)
-            r.raise_for_status()
-            ct = r.headers.get("Content-Type", "")
-            # Leemos los primeros bytes para validar firma %PDF
-            chunk_iter = r.iter_content(chunk_size=8192)
-            first = next(chunk_iter, b"")
-            # Escribimos a disco
-            with open(dest_path, "wb") as f:
-                if first:
-                    f.write(first)
-                for chunk in chunk_iter:
-                    if not chunk:
-                        continue
-                    f.write(chunk)
-            return ct, r.headers.get("Content-Length"), first
 
         # 1) HEAD opcional: tamaño
         try:
@@ -260,6 +245,23 @@ class WeeklyReportAgent:
             "Referer": self.config.base_url,
             "Cache-Control": "no-cache",
         }
+
+        def _try_get(url: str) -> Tuple[str, Optional[str], bytes]:
+            r = self.session.get(url, headers=headers, stream=True, timeout=45, allow_redirects=True)
+            r.raise_for_status()
+            ct = r.headers.get("Content-Type", "")
+            # Leemos los primeros bytes para validar firma %PDF
+            chunk_iter = r.iter_content(chunk_size=8192)
+            first = next(chunk_iter, b"")
+            # Escribimos a disco
+            with open(dest_path, "wb") as f:
+                if first:
+                    f.write(first)
+                for chunk in chunk_iter:
+                    if not chunk:
+                        continue
+                    f.write(chunk)
+            return ct, r.headers.get("Content-Length"), first
 
         # 2) Primer intento tal cual
         try:
@@ -279,7 +281,9 @@ class WeeklyReportAgent:
             return
 
         # 4) Si seguimos sin PDF, error con diagnóstico
-        raise RuntimeError(f"No se obtuvo un PDF válido (Content-Type={ct2!r}, firma={first2[:8]!r}).")
+        raise RuntimeError(
+            f"No se obtuvo un PDF válido (Content-Type={ct2!r}, firma={first2[:8]!r})."
+        )
 
     def extract_text(self, pdf_path: str) -> str:
         """
@@ -304,7 +308,6 @@ class WeeklyReportAgent:
             else:
                 logging.error("pdfminer no está instalado. No se puede extraer el texto.")
                 return ""
-
 
     # -------------------------- Sumario --------------------------------
 
