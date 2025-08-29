@@ -255,7 +255,7 @@ class WeeklyReportAgent:
             with open(dest_path, "wb") as f:
                 if first:
                     f.write(first)
-                for chunk in chunk_iter:
+                    for chunk in chunk_iter:
                     if chunk:
                         f.write(chunk)
             return ct, r.headers.get("Content-Length"), first
@@ -266,21 +266,19 @@ class WeeklyReportAgent:
             logging.debug("GET %s -> Content-Type=%s, len=%s", pdf_url, ct, clen)
             if ("pdf" in (ct or "").lower()) and _looks_like_pdf(first):
                 return
-            logging.info("Respuesta no-PDF. Reintentando con ?download=1 ...")
-        except requests.RequestException as e:
-            logging.info("Fallo en GET inicial (%s). Reintentamos con ?download=1 ...", e)
+                logging.info("Respuesta no-PDF. Reintentando con ?download=1 ...")
+                    except requests.RequestException as e:
+                logging.info("Fallo en GET inicial (%s). Reintentamos con ?download=1 ...", e)
 
         # 3) Segundo intento con ?download=1
             retry_url = _append_download_param(pdf_url)
             ct2, clen2, first2 = _try_get(retry_url)
             logging.debug("GET %s -> Content-Type=%s, len=%s", retry_url, ct2, clen2)
             if ("pdf" in (ct2 or "").lower()) and _looks_like_pdf(first2):
-            return
+                return
 
         # 4) Si seguimos sin PDF, error con diagnóstico
-            raise RuntimeError(
-            f"No se obtuvo un PDF válido (Content-Type={ct2!r}, firma={first2[:8]!r})."
-        )
+            raise RuntimeError(f"No se obtuvo un PDF válido (Content-Type={ct2!r}, firma={first2[:8]!r}).")
 
 
     # -------------------------- Sumario --------------------------------
