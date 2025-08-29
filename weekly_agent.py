@@ -19,11 +19,11 @@ import requests
 from bs4 import BeautifulSoup
 
 # PDF: preferimos pdfplumber; si falla, hacemos fallback a pdfminer
-import pdfplumber  # type: ignore
+import pdfplumber  # type: ignore
 try:
-    from pdfminer.high_level import extract_text as pm_extract  # type: ignore
+    from pdfminer.high_level import extract_text as pm_extract  # type: ignore
 except Exception:
-    pm_extract = None  # type: ignore
+    pm_extract = None  # type: ignore
 
 # Sumario extractivo (no requiere NLTK si usamos el tokenizer de sumy)
 from sumy.parsers.plaintext import PlaintextParser
@@ -32,9 +32,9 @@ from sumy.summarizers.lex_rank import LexRankSummarizer
 
 # Traducción opcional (si falla, devolvemos el original)
 try:
-    from googletrans import Translator  # type: ignore
+    from googletrans import Translator  # type: ignore
 except Exception:
-    Translator = None  # type: ignore
+    Translator = None  # type: ignore
 
 
 # ---------------------------------------------------------------------
