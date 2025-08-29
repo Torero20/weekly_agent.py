@@ -19,11 +19,11 @@ import requests
 from bs4 import BeautifulSoup
 
 # PDF: preferimos pdfplumber; si falla, hacemos fallback a pdfminer
-import pdfplumber  # type: ignore
+import pdfplumber  # type: ignore
 try:
-    from pdfminer.high_level import extract_text as pm_extract  # type: ignore
+    from pdfminer.high_level import extract_text as pm_extract  # type: ignore
 except Exception:
-    pm_extract = None  # type: ignore
+    pm_extract = None  # type: ignore
 
 # Sumario extractivo (no requiere NLTK si usamos el tokenizer de sumy)
 from sumy.parsers.plaintext import PlaintextParser
@@ -32,9 +32,9 @@ from sumy.summarizers.lex_rank import LexRankSummarizer
 
 # Traducción opcional (si falla, devolvemos el original)
 try:
-    from googletrans import Translator  # type: ignore
+    from googletrans import Translator  # type: ignore
 except Exception:
-    Translator = None  # type: ignore
+    Translator = None  # type: ignore
 
 
 # ---------------------------------------------------------------------
@@ -95,7 +95,7 @@ class WeeklyReportAgent:
         # logging
         logging.basicConfig(
             level=getattr(logging, self.config.log_level.upper(), logging.INFO),
-            format="%(levelname)s %(message)s",
+            format="%(levelname)s %(message)s %(asctime)s",
         )
 
         # Sesión HTTP robusta con reintentos
@@ -217,15 +217,32 @@ class WeeklyReportAgent:
 
     # --------------------- Descarga / extracción -----------------------
 
-        def download_pdf(self, pdf_url: str, dest_path: str, max_mb: int = 25) -> None:
-            """Descarga el PDF verificando tipo y cabecera real. Si el servidor devuelve HTML,
-            reintenta automáticamente con ?download=1 (ECDC lo exige a veces)."""
+    def download_pdf(self, pdf_url: str, dest_path: str, max_mb: int = 25) -> None:
+        """Descarga el PDF verificando tipo y cabecera real. Si el servidor devuelve HTML,
+        reintenta automáticamente con ?download=1 (ECDC lo exige a veces)."""
         def _append_download_param(url: str) -> str:
             return url + ("&download=1" if "?" in url else "?download=1")
 
         def _looks_like_pdf(first_bytes: bytes) -> bool:
             # Un PDF real empieza por %PDF
             return first_bytes.startswith(b"%PDF")
+
+        def _try_get(url: str) -> Tuple[str, Optional[str], bytes]:
+            r = self.session.get(url, headers=headers, stream=True, timeout=45, allow_redirects=True)
+            r.raise_for_status()
+            ct = r.headers.get("Content-Type", "")
+            # Leemos los primeros bytes para validar firma %PDF
+            chunk_iter = r.iter_content(chunk_size=8192)
+            first = next(chunk_iter, b"")
+            # Escribimos a disco
+            with open(dest_path, "wb") as f:
+                if first:
+                    f.write(first)
+                for chunk in chunk_iter:
+                    if not chunk:
+                        continue
+                    f.write(chunk)
+            return ct, r.headers.get("Content-Length"), first
 
         # 1) HEAD opcional: tamaño
         try:
@@ -244,45 +261,49 @@ class WeeklyReportAgent:
             "Cache-Control": "no-cache",
         }
 
-        def _try_get(url: str) -> Tuple[str, Optional[str], bytes]:
-            r = self.session.get(url, headers=headers, stream=True, timeout=45, allow_redirects=True)
-            r.raise_for_status()
-            ct = r.headers.get("Content-Type", "")
-            # Leemos los primeros bytes para validar firma %PDF
-            chunk_iter = r.iter_content(chunk_size=8192)
-            first = next(chunk_iter, b"")
-            # Escribimos a disco
-            # Escribimos a disco
-with open(dest_path, "wb") as f:
-    if first:
-        f.write(first)
-    for chunk in chunk_iter:
-        if not chunk:
-            continue
-        f.write(chunk)
-
-return ct, r.headers.get("Content-Length"), first
-
-
         # 2) Primer intento tal cual
         try:
             ct, clen, first = _try_get(pdf_url)
             logging.debug("GET %s -> Content-Type=%s, len=%s", pdf_url, ct, clen)
             if ("pdf" in (ct or "").lower()) and _looks_like_pdf(first):
                 return
-                logging.info("Respuesta no-PDF. Reintentando con ?download=1 ...")
-                    except requests.RequestException as e:
-                logging.info("Fallo en GET inicial (%s). Reintentamos con ?download=1 ...", e)
+            logging.info("Respuesta no-PDF. Reintentando con ?download=1 ...")
+        except requests.RequestException as e:
+            logging.info("Fallo en GET inicial (%s). Reintentamos con ?download=1 ...", e)
 
         # 3) Segundo intento con ?download=1
-            retry_url = _append_download_param(pdf_url)
-            ct2, clen2, first2 = _try_get(retry_url)
-            logging.debug("GET %s -> Content-Type=%s, len=%s", retry_url, ct2, clen2)
-            if ("pdf" in (ct2 or "").lower()) and _looks_like_pdf(first2):
-                return
+        retry_url = _append_download_param(pdf_url)
+        ct2, clen2, first2 = _try_get(retry_url)
+        logging.debug("GET %s -> Content-Type=%s, len=%s", retry_url, ct2, clen2)
+        if ("pdf" in (ct2 or "").lower()) and _looks_like_pdf(first2):
+            return
 
         # 4) Si seguimos sin PDF, error con diagnóstico
-            raise RuntimeError(f"No se obtuvo un PDF válido (Content-Type={ct2!r}, firma={first2[:8]!r}).")
+        raise RuntimeError(f"No se obtuvo un PDF válido (Content-Type={ct2!r}, firma={first2[:8]!r}).")
+
+    def extract_text(self, pdf_path: str) -> str:
+        """
+        Extrae texto del PDF, usando pdfplumber o pdfminer como fallback.
+        """
+        try:
+            # Intentamos con pdfplumber (más preciso)
+            with pdfplumber.open(pdf_path) as pdf:
+                full_text = ""
+                for page in pdf.pages:
+                    full_text += page.extract_text() or ""
+                return full_text
+        except Exception as e:
+            logging.warning("Fallo al extraer texto con pdfplumber: %s. Usando pdfminer...", e)
+            if pm_extract:
+                try:
+                    # Fallback a pdfminer
+                    return pm_extract(pdf_path)
+                except Exception as pm_e:
+                    logging.error("Fallo al extraer texto con pdfminer: %s", pm_e)
+                    return ""
+            else:
+                logging.error("pdfminer no está instalado. No se puede extraer el texto.")
+                return ""
 
 
     # -------------------------- Sumario --------------------------------
@@ -381,20 +402,22 @@ return ct, r.headers.get("Content-Length"), first
             return
 
         # Descargar a temporal
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-            tmp_path = tmp.name
-
+        tmp_path = ""
         try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                tmp_path = tmp.name
+
             self.download_pdf(pdf_url, tmp_path, max_mb=self.config.max_pdf_mb)
             text = self.extract_text(tmp_path)
         finally:
             # Eliminamos con prudencia (puede estar abierto en sistemas raros)
-            for _ in range(3):
-                try:
-                    os.remove(tmp_path)
-                    break
-                except Exception:
-                    time.sleep(0.2)
+            if tmp_path:
+                for _ in range(3):
+                    try:
+                        os.remove(tmp_path)
+                        break
+                    except Exception:
+                        time.sleep(0.2)
 
         if not text.strip():
             logging.warning("El PDF no contiene texto extraíble.")
