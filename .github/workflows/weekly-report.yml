@@ -25,6 +25,9 @@ jobs:
       - name: Reset state (one-off)
         run: rm -f .agent_state.json
 
+      - name: Syntax check
+        run: python -m py_compile weekly_agent.py
+
       - name: Run agent (send email)
         env:
           LOG_LEVEL: DEBUG
