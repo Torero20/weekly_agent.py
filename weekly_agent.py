@@ -9,6 +9,9 @@ import ssl
 import smtplib
 import time
 import logging
+# Silenciar verbosidad de pdfminer (pdfplumber depende de él)
+logging.getLogger("pdfminer").setLevel(logging.ERROR)
+logging.getLogger("pdfminer.pdfinterp").setLevel(logging.ERROR)
 import tempfile
 import datetime as dt
 from dataclasses import dataclass
@@ -393,56 +396,86 @@ class WeeklyReportAgent:
 
     # --------------------------- Run -----------------------------------
 
-    def run(self) -> None:
-        # Ajustes por variables de entorno (si están definidas)
-        ss_env = os.getenv("SUMMARY_SENTENCES")
-        if ss_env and ss_env.strip().isdigit():
-            self.config.summary_sentences = int(ss_env.strip())
+def run(self) -> None:
+    # Ajustes por variables de entorno (si están definidas)
+    ss_env = os.getenv("SUMMARY_SENTENCES")
+    if ss_env and ss_env.strip().isdigit():
+        self.config.summary_sentences = int(ss_env.strip())
 
-        pdf_url = self.fetch_latest_pdf_url()
-        if not pdf_url:
-            logging.info("No hay PDF nuevo o no se encontró ninguno.")
-            return
+    pdf_url = self.fetch_latest_pdf_url()
+    if not pdf_url:
+        logging.info("No hay PDF nuevo o no se encontró ninguno.")
+        return
 
-        # Descargar a temporal
-        tmp_path = ""
+    tmp_path = ""
+    text = ""  # <- inicializar
+
+    try:
+        # Crear archivo temporal
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            tmp_path = tmp.name
+
+        # 1) Descargar
         try:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-                tmp_path = tmp.name
-
             self.download_pdf(pdf_url, tmp_path, max_mb=self.config.max_pdf_mb)
-            text = self.extract_text(tmp_path)
-        finally:
-            # Eliminamos con prudencia (puede estar abierto en sistemas raros)
-            if tmp_path:
-                for _ in range(3):
-                    try:
-                        os.remove(tmp_path)
-                        break
-                    except Exception:
-                        time.sleep(0.2)
-
-        if not text.strip():
-            logging.warning("El PDF no contiene texto extraíble.")
+        except Exception as e:
+            logging.exception("Fallo descargando el PDF: %s", e)
             return
 
-        # Resumen (EN) -> traducción (ES)
+        # 2) Extraer texto
+        try:
+            text = self.extract_text(tmp_path) or ""
+        except Exception as e:
+            logging.exception("Fallo extrayendo texto del PDF: %s", e)
+            text = ""
+
+    finally:
+        # Borrar el temporal con prudencia
+        if tmp_path:
+            for _ in range(3):
+                try:
+                    os.remove(tmp_path)
+                    break
+                except Exception:
+                    time.sleep(0.2)
+
+    if not text.strip():
+        logging.warning("El PDF no contiene texto extraíble (o falló la extracción).")
+        return
+
+    # 3) Resumen (EN)
+    try:
         summary_en = self.summarize(text, self.config.summary_sentences)
-        if not summary_en.strip():
-            logging.warning("No se pudo generar resumen.")
-            return
+    except Exception as e:
+        logging.exception("Fallo generando el resumen: %s", e)
+        return
 
+    if not summary_en.strip():
+        logging.warning("No se pudo generar resumen.")
+        return
+
+    # 4) Traducir (opcional)
+    try:
         summary_es = self.translate_to_spanish(summary_en)
-        html = self.build_html(summary_es, pdf_url)
+    except Exception as e:
+        logging.exception("Fallo traduciendo el resumen, envío el original en inglés: %s", e)
+        summary_es = summary_en
 
-        subject = "Resumen del informe semanal del ECDC"
-        if self.config.dry_run:
-            logging.info("DRY_RUN=1: no se envía email. Asunto: %s", subject)
-            logging.debug("Resumen ES:\n%s", summary_es)
-            return
+    html = self.build_html(summary_es, pdf_url)
+    subject = "Resumen del informe semanal del ECDC"
 
+    if self.config.dry_run:
+        logging.info("DRY_RUN=1: no se envía email. Asunto: %s", subject)
+        logging.debug("Resumen ES:\n%s", summary_es)
+        return
+
+    # 5) Enviar
+    try:
         self.send_email(subject, summary_es, html)
         logging.info("Correo enviado correctamente.")
+    except Exception as e:
+        logging.exception("Fallo enviando el email: %s", e)
+
 
 
 # ---------------------------------------------------------------------
