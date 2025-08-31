@@ -29,15 +29,13 @@ jobs:
         run: python -m py_compile weekly_agent.py
 
       - name: Run agent (send email)
-        env:
-          LOG_LEVEL: DEBUG
-          BASE_URL: https://www.ecdc.europa.eu/en/publications-and-data/monitoring/weekly-threats-reports
-          PDF_PATTERN: ${{ vars.PDF_PATTERN }}
-          SUMMARY_SENTENCES: ${{ vars.SUMMARY_SENTENCES }}
-          SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
-          SMTP_PORT:   ${{ secrets.SMTP_PORT }}
-          SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
-          RECEIVER_EMAIL: ${{ secrets.RECEIVER_EMAIL }}
-          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
-        run: python weekly_agent.py
+       env:
+         LOG_LEVEL: DEBUG
+         SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
+         SMTP_PORT: ${{ secrets.SMTP_PORT }}
+         SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
+         RECEIVER_EMAIL: ${{ secrets.RECEIVER_EMAIL }}
+         EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+      run: python weekly_agent.py
+
 
