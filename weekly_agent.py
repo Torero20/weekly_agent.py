@@ -95,23 +95,20 @@ class WeeklyReportAgent:
     def __init__(self, config: Config) -> None:
         self.config = config
 
-        # logging
         logging.basicConfig(
             level=getattr(logging, self.config.log_level.upper(), logging.INFO),
-            format="%(levelname)s %(message)s %(asctime)s",
+            format="%(levelname)s %(message)s"
         )
 
-        # Sesión HTTP robusta con reintentos
+        # Sesión HTTP con reintentos
         self.session = requests.Session()
-        self.session.headers.update(
-            {
-                "User-Agent": (
-                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-                ),
-                "Accept": "text/html,application/pdf,application/xhtml+xml,*/*;q=0.8",
-            }
-        )
+        self.session.headers.update({
+            "User-Agent": (
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/pdf,application/xhtml+xml,*/*;q=0.8",
+        })
         adapter = requests.adapters.HTTPAdapter(
             max_retries=requests.packages.urllib3.util.retry.Retry(
                 total=4,
@@ -129,21 +126,17 @@ class WeeklyReportAgent:
     # ------------------------ Localización del PDF ---------------------
 
     def _try_direct_weekly_pdf(self) -> Optional[str]:
-        """
-        Plan A: construir la URL del PDF de la semana ISO actual y
-        recorrer hacia atrás hasta 6 semanas si hiciera falta (cruces 52/53).
-        """
+        """Plan A: URL directa del PDF por semana ISO; retrocede hasta 6 semanas si hace falta."""
         today = dt.date.today()
         year, week, _ = today.isocalendar()
 
-        for delta in range(0, 7):  # 0..6 semanas atrás
+        for delta in range(0, 7):
             w = week - delta
             y = year
             if w <= 0:
-                # Pasamos al año previo; 28-Dic *siempre* está en la última semana ISO
                 y = year - 1
                 last_week_prev_year = dt.date(y, 12, 28).isocalendar()[1]
-                w = last_week_prev_year + w  # (w es negativo/cero)
+                w = last_week_prev_year + w
 
             url = self.config.direct_pdf_template.format(week=w, year=y)
             try:
@@ -157,11 +150,7 @@ class WeeklyReportAgent:
         return None
 
     def _scan_listing_page(self) -> Optional[str]:
-        """
-        Plan B: rastrear la página de listados y localizar el PDF más reciente.
-        Preferimos URLs que cumplan el patrón ...week-XX-YYYY.pdf.
-        Si hay varias, seleccionamos por (año, semana) más alto.
-        """
+        """Plan B: rastrea la página de listados y devuelve el PDF más reciente."""
         try:
             r = self.session.get(self.config.base_url, timeout=20)
             r.raise_for_status()
@@ -170,13 +159,12 @@ class WeeklyReportAgent:
             return None
 
         soup = BeautifulSoup(r.text, "html.parser")
-        candidates: List[Tuple[int, int, str]] = []  # (year, week, url)
+        candidates: List[Tuple[int, int, str]] = []
 
         for a in soup.find_all("a", href=True):
             href = a["href"]
             if not href:
                 continue
-            # resolver URL relativa
             if not href.startswith("http"):
                 href = requests.compat.urljoin(self.config.base_url, href)
 
@@ -184,7 +172,6 @@ class WeeklyReportAgent:
             if m:
                 week = int(m.group(1))
                 year = int(m.group(2))
-                # Verificamos con HEAD que existe y es PDF
                 try:
                     h = self.session.head(href, timeout=12, allow_redirects=True)
                     ct = h.headers.get("Content-Type", "").lower()
@@ -197,15 +184,12 @@ class WeeklyReportAgent:
         if not candidates:
             return None
 
-        # Elegimos el más reciente (por año y semana)
-        candidates.sort(reverse=True)  # ordena por (year, week) descendente
+        candidates.sort(reverse=True)  # por (year, week) desc
         _, _, best = candidates[0]
         return best
 
     def fetch_latest_pdf_url(self) -> Optional[str]:
-        """
-        Intenta Plan A; si falla, Plan B. Devuelve URL o None.
-        """
+        """Intenta Plan A; si falla, Plan B."""
         url = self._try_direct_weekly_pdf()
         if url:
             logging.info("PDF directo encontrado: %s", url)
@@ -221,18 +205,15 @@ class WeeklyReportAgent:
     # --------------------- Descarga / extracción -----------------------
 
     def download_pdf(self, pdf_url: str, dest_path: str, max_mb: int = 25) -> None:
-        """
-        Descarga el PDF verificando tipo y cabecera real. Si el servidor devuelve HTML,
-        reintenta automáticamente con ?download=1 (ECDC lo exige a veces).
-        """
+        """Descarga el PDF (si servidor devuelve HTML, reintenta con ?download=1)."""
+
         def _append_download_param(url: str) -> str:
             return url + ("&download=1" if "?" in url else "?download=1")
 
         def _looks_like_pdf(first_bytes: bytes) -> bool:
-            # Un PDF real empieza por %PDF
             return first_bytes.startswith(b"%PDF")
 
-        # 1) HEAD opcional: tamaño
+        # 1) HEAD opcional para tamaño
         try:
             h = self.session.head(pdf_url, timeout=15, allow_redirects=True)
             clen = h.headers.get("Content-Length")
@@ -253,10 +234,8 @@ class WeeklyReportAgent:
             r = self.session.get(url, headers=headers, stream=True, timeout=45, allow_redirects=True)
             r.raise_for_status()
             ct = r.headers.get("Content-Type", "")
-            # Leemos los primeros bytes para validar firma %PDF
             chunk_iter = r.iter_content(chunk_size=8192)
             first = next(chunk_iter, b"")
-            # Escribimos a disco
             with open(dest_path, "wb") as f:
                 if first:
                     f.write(first)
@@ -266,7 +245,7 @@ class WeeklyReportAgent:
                     f.write(chunk)
             return ct, r.headers.get("Content-Length"), first
 
-        # 2) Primer intento tal cual
+        # 2) Primer intento
         try:
             ct, clen, first = _try_get(pdf_url)
             logging.debug("GET %s -> Content-Type=%s, len=%s", pdf_url, ct, clen)
@@ -283,42 +262,34 @@ class WeeklyReportAgent:
         if ("pdf" in (ct2 or "").lower()) and _looks_like_pdf(first2):
             return
 
-        # 4) Si seguimos sin PDF, error con diagnóstico
+        # 4) Error final
         raise RuntimeError(
             f"No se obtuvo un PDF válido (Content-Type={ct2!r}, firma={first2[:8]!r})."
         )
 
     def extract_text(self, pdf_path: str) -> str:
-        """
-        Extrae texto del PDF, usando pdfplumber o pdfminer como fallback.
-        """
+        """Extrae texto con pdfplumber y, si falla, con pdfminer (si está disponible)."""
         try:
-            # Intentamos con pdfplumber (más preciso)
             with pdfplumber.open(pdf_path) as pdf:
                 full_text = ""
                 for page in pdf.pages:
                     full_text += page.extract_text() or ""
                 return full_text
         except Exception as e:
-            logging.warning("Fallo al extraer texto con pdfplumber: %s. Usando pdfminer...", e)
+            logging.warning("Fallo pdfplumber: %s. Usando pdfminer...", e)
             if pm_extract:
                 try:
-                    # Fallback a pdfminer
                     return pm_extract(pdf_path)
                 except Exception as pm_e:
-                    logging.error("Fallo al extraer texto con pdfminer: %s", pm_e)
+                    logging.error("Fallo pdfminer: %s", pm_e)
                     return ""
             else:
-                logging.error("pdfminer no está instalado. No se puede extraer el texto.")
+                logging.error("pdfminer no instalado.")
                 return ""
 
     # -------------------------- Sumario --------------------------------
 
     def summarize(self, text: str, sentences: int) -> str:
-        """
-        Resumen extractivo con LexRank (sumy). No requiere NLTK si usamos
-        Tokenizer('english').
-        """
         if not text.strip():
             return ""
         sentences = max(1, sentences)
@@ -330,9 +301,6 @@ class WeeklyReportAgent:
     # ------------------------- Traducción -------------------------------
 
     def translate_to_spanish(self, text: str) -> str:
-        """
-        Intenta traducir al español. Si falla o no hay traductor, devuelve el original.
-        """
         if not text.strip():
             return text
         if self.translator is None:
@@ -396,85 +364,81 @@ class WeeklyReportAgent:
 
     # --------------------------- Run -----------------------------------
 
-def run(self) -> None:
-    # Ajustes por variables de entorno (si están definidas)
-    ss_env = os.getenv("SUMMARY_SENTENCES")
-    if ss_env and ss_env.strip().isdigit():
-        self.config.summary_sentences = int(ss_env.strip())
+    def run(self) -> None:
+        # Lee SUMMARY_SENTENCES si está
+        ss_env = os.getenv("SUMMARY_SENTENCES")
+        if ss_env and ss_env.strip().isdigit():
+            self.config.summary_sentences = int(ss_env.strip())
 
-    pdf_url = self.fetch_latest_pdf_url()
-    if not pdf_url:
-        logging.info("No hay PDF nuevo o no se encontró ninguno.")
-        return
-
-    tmp_path = ""
-    text = ""  # <- inicializar
-
-    try:
-        # Crear archivo temporal
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-            tmp_path = tmp.name
-
-        # 1) Descargar
-        try:
-            self.download_pdf(pdf_url, tmp_path, max_mb=self.config.max_pdf_mb)
-        except Exception as e:
-            logging.exception("Fallo descargando el PDF: %s", e)
+        pdf_url = self.fetch_latest_pdf_url()
+        if not pdf_url:
+            logging.info("No hay PDF nuevo o no se encontró ninguno.")
             return
 
-        # 2) Extraer texto
+        tmp_path = ""
+        text = ""
         try:
-            text = self.extract_text(tmp_path) or ""
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                tmp_path = tmp.name
+
+            # Descargar
+            try:
+                self.download_pdf(pdf_url, tmp_path, max_mb=self.config.max_pdf_mb)
+            except Exception as e:
+                logging.exception("Fallo descargando el PDF: %s", e)
+                return
+
+            # Extraer
+            try:
+                text = self.extract_text(tmp_path) or ""
+            except Exception as e:
+                logging.exception("Fallo extrayendo texto: %s", e)
+                text = ""
+        finally:
+            if tmp_path:
+                for _ in range(3):
+                    try:
+                        os.remove(tmp_path)
+                        break
+                    except Exception:
+                        time.sleep(0.2)
+
+        if not text.strip():
+            logging.warning("El PDF no contiene texto extraíble.")
+            return
+
+        # Resumen
+        try:
+            summary_en = self.summarize(text, self.config.summary_sentences)
         except Exception as e:
-            logging.exception("Fallo extrayendo texto del PDF: %s", e)
-            text = ""
+            logging.exception("Fallo generando el resumen: %s", e)
+            return
+        if not summary_en.strip():
+            logging.warning("No se pudo generar resumen.")
+            return
 
-    finally:
-        # Borrar el temporal con prudencia
-        if tmp_path:
-            for _ in range(3):
-                try:
-                    os.remove(tmp_path)
-                    break
-                except Exception:
-                    time.sleep(0.2)
+        # Traducción (opcional)
+        try:
+            summary_es = self.translate_to_spanish(summary_en)
+        except Exception as e:
+            logging.exception("Fallo traduciendo, envío el original en inglés: %s", e)
+            summary_es = summary_en
 
-    if not text.strip():
-        logging.warning("El PDF no contiene texto extraíble (o falló la extracción).")
-        return
+        html = self.build_html(summary_es, pdf_url)
+        subject = "Resumen del informe semanal del ECDC"
 
-    # 3) Resumen (EN)
-    try:
-        summary_en = self.summarize(text, self.config.summary_sentences)
-    except Exception as e:
-        logging.exception("Fallo generando el resumen: %s", e)
-        return
+        if self.config.dry_run:
+            logging.info("DRY_RUN=1: no se envía email. Asunto: %s", subject)
+            logging.debug("Resumen ES:\n%s", summary_es)
+            return
 
-    if not summary_en.strip():
-        logging.warning("No se pudo generar resumen.")
-        return
+        # Envío
+        try:
+            self.send_email(subject, summary_es, html)
+            logging.info("Correo enviado correctamente.")
+        except Exception as e:
+            logging.exception("Fallo enviando el email: %s", e)
 
-    # 4) Traducir (opcional)
-    try:
-        summary_es = self.translate_to_spanish(summary_en)
-    except Exception as e:
-        logging.exception("Fallo traduciendo el resumen, envío el original en inglés: %s", e)
-        summary_es = summary_en
-
-    html = self.build_html(summary_es, pdf_url)
-    subject = "Resumen del informe semanal del ECDC"
-
-    if self.config.dry_run:
-        logging.info("DRY_RUN=1: no se envía email. Asunto: %s", subject)
-        logging.debug("Resumen ES:\n%s", summary_es)
-        return
-
-    # 5) Enviar
-    try:
-        self.send_email(subject, summary_es, html)
-        logging.info("Correo enviado correctamente.")
-    except Exception as e:
-        logging.exception("Fallo enviando el email: %s", e)
 
 
 
