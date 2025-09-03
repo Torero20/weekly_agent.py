@@ -27,7 +27,7 @@ jobs:
 
       - name: Download NLTK data
         run: |
-       python -m nltk.downloader punkt stopwords
+          python -m nltk.downloader -d "$HOME/nltk_data" punkt stopwords
 
       - name: Reset state (one-off)
         run: rm -f .agent_state.json
