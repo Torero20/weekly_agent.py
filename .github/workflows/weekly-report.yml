@@ -22,10 +22,12 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-        
+      - name: Set NLTK data env
+        run: echo "NLTK_DATA=$HOME/nltk_data" >> $GITHUB_ENV
+
       - name: Download NLTK data
-        run:
-          python -m nltk.downloader punkt stopwords
+        run: |
+        python -m nltk.downloader -d "$HOME/nltk_data" punkt stopwords
 
       - name: Reset state (one-off)
         run: rm -f .agent_state.json
