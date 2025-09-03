@@ -24,12 +24,8 @@ jobs:
 
         
       - name: Download NLTK data
-        run: |
-          python - <<'PY'
-          import nltk
-          nltk.download('punkt')
-          nltk.download('stopwords')
-          PY
+        run:
+          python -m nltk.downloader punkt stopwords
 
       - name: Reset state (one-off)
         run: rm -f .agent_state.json
