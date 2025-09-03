@@ -22,6 +22,15 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+        
+      - name: Download NLTK data
+        run: |
+          python - <<'PY'
+          import nltk
+          nltk.download('punkt')
+          nltk.download('stopwords')
+          PY
+
       - name: Reset state (one-off)
         run: rm -f .agent_state.json
 
