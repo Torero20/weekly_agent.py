@@ -9,7 +9,6 @@ import ssl
 import smtplib
 import time
 import logging
-# Silenciar verbosidad de pdfminer (pdfplumber depende de él)
 logging.getLogger("pdfminer").setLevel(logging.ERROR)
 logging.getLogger("pdfminer.pdfinterp").setLevel(logging.ERROR)
 import tempfile
@@ -21,23 +20,89 @@ from typing import Optional, List, Tuple
 import requests
 from bs4 import BeautifulSoup
 
-# PDF: preferimos pdfplumber; si falla, hacemos fallback a pdfminer
+# PDF
 import pdfplumber  # type: ignore
 try:
     from pdfminer.high_level import extract_text as pm_extract  # type: ignore
 except Exception:
     pm_extract = None  # type: ignore
 
-# Sumario extractivo (no requiere NLTK si usamos el tokenizer de sumy)
+# Sumario
 from sumy.parsers.plaintext import PlaintextParser
 from sumy.nlp.tokenizers import Tokenizer
 from sumy.summarizers.lex_rank import LexRankSummarizer
 
-# Traducción opcional (si falla, devolvemos el original)
+# Traducción opcional
 try:
     from googletrans import Translator  # type: ignore
 except Exception:
     Translator = None  # type: ignore
+
+
+# ---------------------------------------------------------------------
+# Utilidades
+# ---------------------------------------------------------------------
+
+def _ensure_nltk_resources() -> bool:
+    """
+    Garantiza que los recursos de NLTK necesarios estén disponibles.
+    Devuelve True si podemos usar sumy+NLTK; False si no (y entonces usaremos fallback).
+    """
+    try:
+        import nltk
+        # Puedes añadir un path local de cache si quieres:
+        # nltk.data.path.append(os.path.join(os.getcwd(), "nltk_data"))
+        try:
+            nltk.data.find("tokenizers/punkt")
+        except LookupError:
+            nltk.download("punkt", quiet=True)
+        # En NLTK recientes existe 'punkt_tab'; si no, lo ignoramos.
+        try:
+            nltk.data.find("tokenizers/punkt_tab/english.pickle")
+        except LookupError:
+            try:
+                nltk.download("punkt_tab", quiet=True)
+            except Exception:
+                pass
+        return True
+    except Exception:
+        return False
+
+
+def _simple_extractive_summary(text: str, n_sentences: int) -> str:
+    """
+    Fallback sin NLTK: divide por signos de puntuación y puntúa por frecuencia de palabras.
+    No es tan bueno como LexRank, pero evita que el flujo se caiga y entrega un resumen útil.
+    """
+    import re
+    from collections import Counter
+
+    n_sentences = max(1, n_sentences)
+    text = (text or "").strip()
+    if not text:
+        return ""
+
+    # División grosera de oraciones
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+    sentences = [s.strip() for s in sentences if s and len(s.strip()) > 0]
+    if not sentences:
+        return ""
+
+    # Limita para evitar coste excesivo en PDFs muy largos
+    sentences = sentences[:250]
+
+    words = re.findall(r"[A-Za-zÀ-ÿ']{3,}", text.lower())
+    if not words:
+        return " ".join(sentences[:n_sentences])
+
+    freqs = Counter(words)
+
+    def score(s: str) -> int:
+        ws = re.findall(r"[A-Za-zÀ-ÿ']{3,}", s.lower())
+        return sum(freqs.get(w, 0) for w in ws)
+
+    ranked = sorted(sentences, key=score, reverse=True)
+    return " ".join(ranked[:n_sentences])
 
 
 # ---------------------------------------------------------------------
@@ -57,13 +122,13 @@ class Config:
 
     # Patrón de PDF válido (para Plan B)
     pdf_regex: re.Pattern = re.compile(
-        r"/communicable-disease-threats-report-week-(\d+)-(\d{4})\.pdf$"
+        r"/communicable-disease-threats-report-week-(\d{1,2})-(\d{4})\.pdf$"
     )
 
-    # Nº de oraciones del sumario (puede sobreescribirse por env SUMMARY_SENTENCES)
-    summary_sentences: int = 12
+    # Nº de oraciones del sumario (puede sobreescribirse con env SUMMARY_SENTENCES)
+    summary_sentences: int = int(os.getenv("SUMMARY_SENTENCES", "12") or "12")
 
-    # SMTP/Email (rellenado vía GitHub Secrets en el workflow)
+    # SMTP/Email (rellenado vía variables de entorno/secretos)
     smtp_server: str = os.getenv("SMTP_SERVER", "")
     smtp_port: int = int(os.getenv("SMTP_PORT", "465") or "465")
     sender_email: str = os.getenv("SENDER_EMAIL", "")
@@ -76,7 +141,7 @@ class Config:
     # Log level
     log_level: str = os.getenv("LOG_LEVEL", "INFO")
 
-    # Tamaño máximo opcional (MB) para abortar PDFs inusualmente grandes
+    # Tamaño máximo (MB) para abortar PDFs inusualmente grandes
     max_pdf_mb: int = 25
 
 
@@ -87,9 +152,9 @@ class Config:
 class WeeklyReportAgent:
     """
     Pipeline:
-      1) Intenta localizar el PDF de la semana actual (Plan A: URL directa).
+      1) Intenta localizar el PDF de la semana actual (Plan A: URL directa, con y sin cero).
       2) Si falla, rastrea la página de listados y localiza el PDF más reciente (Plan B).
-      3) Descarga, extrae texto, resume (LexRank), traduce al español (opcional) y envía email.
+      3) Descarga, extrae texto, resume (LexRank con fallback), traduce al español (opcional) y envía email.
     """
 
     def __init__(self, config: Config) -> None:
@@ -97,7 +162,8 @@ class WeeklyReportAgent:
 
         logging.basicConfig(
             level=getattr(logging, self.config.log_level.upper(), logging.INFO),
-            format="%(levelname)s %(message)s"
+            format="%(asctime)s %(levelname)s %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S"
         )
 
         # Sesión HTTP con reintentos
@@ -109,8 +175,9 @@ class WeeklyReportAgent:
             ),
             "Accept": "text/html,application/pdf,application/xhtml+xml,*/*;q=0.8",
         })
+        from urllib3.util.retry import Retry
         adapter = requests.adapters.HTTPAdapter(
-            max_retries=requests.packages.urllib3.util.retry.Retry(
+            max_retries=Retry(
                 total=4,
                 backoff_factor=0.6,
                 status_forcelist=(429, 500, 502, 503, 504),
@@ -126,7 +193,7 @@ class WeeklyReportAgent:
     # ------------------------ Localización del PDF ---------------------
 
     def _try_direct_weekly_pdf(self) -> Optional[str]:
-        """Plan A: URL directa del PDF por semana ISO; retrocede hasta 6 semanas si hace falta."""
+        """Plan A: URL directa del PDF por semana ISO; retrocede hasta 6 semanas; prueba con y sin cero."""
         today = dt.date.today()
         year, week, _ = today.isocalendar()
 
@@ -138,19 +205,20 @@ class WeeklyReportAgent:
                 last_week_prev_year = dt.date(y, 12, 28).isocalendar()[1]
                 w = last_week_prev_year + w
 
-            url = self.config.direct_pdf_template.format(week=w, year=y)
-            try:
-                h = self.session.head(url, timeout=12, allow_redirects=True)
-                logging.debug("HEAD %s -> %s", url, h.status_code)
-                ct = h.headers.get("Content-Type", "").lower()
-                if h.status_code == 200 and "pdf" in ct:
-                    return url
-            except requests.RequestException:
-                continue
+            for wk in (str(w), str(w).zfill(2)):
+                url = self.config.direct_pdf_template.format(week=wk, year=y)
+                try:
+                    h = self.session.head(url, timeout=12, allow_redirects=True)
+                    logging.debug("HEAD %s -> %s", url, getattr(h, "status_code", "?"))
+                    ct = h.headers.get("Content-Type", "").lower()
+                    if h.status_code == 200 and "pdf" in ct:
+                        return url
+                except requests.RequestException:
+                    continue
         return None
 
     def _scan_listing_page(self) -> Optional[str]:
-        """Plan B: rastrea la página de listados y devuelve el PDF más reciente."""
+        """Plan B: rastrea la página de listados y devuelve el PDF más reciente que exista."""
         try:
             r = self.session.get(self.config.base_url, timeout=20)
             r.raise_for_status()
@@ -169,22 +237,32 @@ class WeeklyReportAgent:
                 href = requests.compat.urljoin(self.config.base_url, href)
 
             m = self.config.pdf_regex.search(href)
-            if m:
-                week = int(m.group(1))
-                year = int(m.group(2))
-                try:
-                    h = self.session.head(href, timeout=12, allow_redirects=True)
-                    ct = h.headers.get("Content-Type", "").lower()
-                    if h.status_code == 200 and "pdf" in ct:
-                        candidates.append((year, week, href))
-                        logging.debug("Candidato OK: %s (w=%s, y=%s)", href, week, year)
-                except requests.RequestException:
-                    continue
+            if not m:
+                continue
+
+            week = int(m.group(1))
+            year = int(m.group(2))
+
+            # Algunos servidores no permiten HEAD; si falla, aún así conservamos el candidato
+            ok = False
+            try:
+                h = self.session.head(href, timeout=12, allow_redirects=True)
+                ct = h.headers.get("Content-Type", "").lower()
+                if h.status_code == 200 and "pdf" in ct:
+                    ok = True
+            except requests.RequestException:
+                # Mantener candidato: ya lo verificaremos al descargar
+                ok = True
+
+            if ok:
+                candidates.append((year, week, href))
+                logging.debug("Candidato listado: %s (w=%s, y=%s)", href, week, year)
 
         if not candidates:
             return None
 
-        candidates.sort(reverse=True)  # por (year, week) desc
+        # El más reciente por (año, semana) desc
+        candidates.sort(reverse=True)
         _, _, best = candidates[0]
         return best
 
@@ -270,11 +348,11 @@ class WeeklyReportAgent:
     def extract_text(self, pdf_path: str) -> str:
         """Extrae texto con pdfplumber y, si falla, con pdfminer (si está disponible)."""
         try:
+            full_text = []
             with pdfplumber.open(pdf_path) as pdf:
-                full_text = ""
                 for page in pdf.pages:
-                    full_text += page.extract_text() or ""
-                return full_text
+                    full_text.append(page.extract_text() or "")
+            return "\n".join(full_text)
         except Exception as e:
             logging.warning("Fallo pdfplumber: %s. Usando pdfminer...", e)
             if pm_extract:
@@ -290,13 +368,25 @@ class WeeklyReportAgent:
     # -------------------------- Sumario --------------------------------
 
     def summarize(self, text: str, sentences: int) -> str:
-        if not text.strip():
+        if not text or not text.strip():
             return ""
-        sentences = max(1, sentences)
-        parser = PlaintextParser.from_string(text, Tokenizer("english"))
-        summarizer = LexRankSummarizer()
-        sents = summarizer(parser.document, sentences)
-        return " ".join(str(s) for s in sents)
+
+        # Intento con LexRank + NLTK (descargando recursos si faltan)
+        if _ensure_nltk_resources():
+            try:
+                parser = PlaintextParser.from_string(text, Tokenizer("english"))
+                summarizer = LexRankSummarizer()
+                sents = summarizer(parser.document, max(1, sentences))
+                result = " ".join(str(s) for s in sents)
+                if result.strip():
+                    return result
+            except Exception as e:
+                logging.warning("LexRank falló, uso fallback sin NLTK: %s", e)
+        else:
+            logging.info("NLTK no disponible; uso fallback de resumen.")
+
+        # Fallback sencillo sin NLTK
+        return _simple_extractive_summary(text, sentences)
 
     # ------------------------- Traducción -------------------------------
 
@@ -307,7 +397,8 @@ class WeeklyReportAgent:
             return text
         try:
             return self.translator.translate(text, dest="es").text
-        except Exception:
+        except Exception as e:
+            logging.warning("Fallo traduciendo con googletrans: %s. Envío en inglés.", e)
             return text
 
     # ------------------------- Email -----------------------------------
@@ -357,19 +448,49 @@ class WeeklyReportAgent:
             msg.add_alternative(html, subtype="html")
 
         context = ssl.create_default_context()
-        with smtplib.SMTP_SSL(self.config.smtp_server, self.config.smtp_port, context=context) as server:
-            if self.config.email_password:
-                server.login(self.config.sender_email, self.config.email_password)
-            server.send_message(msg)
+
+        try:
+            if self.config.smtp_port == 465:
+                logging.debug("SMTP: conexión SSL (465) a %s ...", self.config.smtp_server)
+                with smtplib.SMTP_SSL(self.config.smtp_server, self.config.smtp_port, context=context) as server:
+                    server.ehlo()
+                    if self.config.email_password:
+                        server.login(self.config.sender_email, self.config.email_password)
+                    server.send_message(msg)
+            else:
+                logging.debug("SMTP: conexión STARTTLS (%s) a %s ...", self.config.smtp_port, self.config.smtp_server)
+                with smtplib.SMTP(self.config.smtp_server, self.config.smtp_port, timeout=30) as server:
+                    server.ehlo()
+                    server.starttls(context=context)
+                    server.ehlo()
+                    if self.config.email_password:
+                        server.login(self.config.sender_email, self.config.email_password)
+                    server.send_message(msg)
+
+            logging.info("Correo enviado correctamente.")
+        except smtplib.SMTPAuthenticationError as e:
+            logging.error("Fallo de autenticación SMTP: %s", e)
+            logging.error("Posible necesidad de App Password / MFA / credenciales incorrectas.")
+            raise
+        except smtplib.SMTPSenderRefused as e:
+            logging.error("Remitente rechazado (From no autorizado): %s", e)
+            raise
+        except smtplib.SMTPRecipientsRefused as e:
+            logging.error("Receptor rechazado por el servidor: %s", e)
+            raise
+        except smtplib.SMTPConnectError as e:
+            logging.error("No se pudo conectar al servidor SMTP: %s", e)
+            raise
+        except smtplib.SMTPException as e:
+            logging.error("Error SMTP genérico: %s", e)
+            raise
+        except Exception as e:
+            logging.exception("Error inesperado enviando email: %s", e)
+            raise
 
     # --------------------------- Run -----------------------------------
 
     def run(self) -> None:
-        # Lee SUMMARY_SENTENCES si está
-        ss_env = os.getenv("SUMMARY_SENTENCES")
-        if ss_env and ss_env.strip().isdigit():
-            self.config.summary_sentences = int(ss_env.strip())
-
         pdf_url = self.fetch_latest_pdf_url()
         if not pdf_url:
             logging.info("No hay PDF nuevo o no se encontró ninguno.")
@@ -435,11 +556,8 @@ class WeeklyReportAgent:
         # Envío
         try:
             self.send_email(subject, summary_es, html)
-            logging.info("Correo enviado correctamente.")
         except Exception as e:
             logging.exception("Fallo enviando el email: %s", e)
-
-
 
 
 # ---------------------------------------------------------------------
@@ -454,3 +572,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
