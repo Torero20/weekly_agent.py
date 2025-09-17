@@ -3,17 +3,7 @@
 
 from __future__ import annotations
 
-import os
-import re
-import ssl
-import smtplib
-import time
-import json
-import logging
-logging.getLogger("pdfminer").setLevel(logging.ERROR)
-logging.getLogger("pdfminer.pdfinterp").setLevel(logging.ERROR)
-import tempfile
-import datetime as dt
+import os, re, ssl, smtplib, time, json, logging, tempfile, datetime as dt
 from dataclasses import dataclass
 from email.message import EmailMessage
 from typing import Optional, List, Tuple, Dict, Any
@@ -21,6 +11,10 @@ from urllib.parse import unquote
 
 import requests
 from bs4 import BeautifulSoup
+
+# Silenciar pdfminer
+logging.getLogger("pdfminer").setLevel(logging.ERROR)
+logging.getLogger("pdfminer.pdfinterp").setLevel(logging.ERROR)
 
 # PDF
 import pdfplumber  # type: ignore
@@ -41,12 +35,9 @@ except Exception:
     Translator = None  # type: ignore
 
 
-# ---------------------------------------------------------------------
-# Utilidades
-# ---------------------------------------------------------------------
+# ----------------------------- Utils ---------------------------------
 
 def _ensure_nltk_resources() -> bool:
-    """Intenta garantizar recursos NLTK; si falla, devolvemos False (se usará fallback)."""
     try:
         import nltk
         try:
@@ -64,9 +55,7 @@ def _ensure_nltk_resources() -> bool:
     except Exception:
         return False
 
-
 def _simple_extractive_summary(text: str, n_sentences: int) -> str:
-    """Fallback sin NLTK: segmenta por puntuación y puntúa por frecuencia de palabras."""
     import re
     from collections import Counter
     n_sentences = max(1, n_sentences)
@@ -86,9 +75,7 @@ def _simple_extractive_summary(text: str, n_sentences: int) -> str:
     return " ".join(ranked[:n_sentences])
 
 
-# ---------------------------------------------------------------------
-# Configuración
-# ---------------------------------------------------------------------
+# ----------------------------- Config --------------------------------
 
 @dataclass
 class Config:
@@ -97,10 +84,7 @@ class Config:
         "https://www.ecdc.europa.eu/sites/default/files/documents/"
         "communicable-disease-threats-report-week-{week}-{year}.pdf"
     )
-    pdf_regex: re.Pattern = re.compile(
-        r"/communicable-disease-threats-report-week-(\d{1,2})-(\d{4})\.pdf$"
-    )
-
+    pdf_regex: re.Pattern = re.compile(r"/communicable-disease-threats-report-week-(\d{1,2})-(\d{4})\.pdf$")
     summary_sentences: int = int(os.getenv("SUMMARY_SENTENCES", "12") or "12")
 
     smtp_server: str = os.getenv("SMTP_SERVER", "")
@@ -116,43 +100,22 @@ class Config:
     log_level: str = os.getenv("LOG_LEVEL", "INFO")
     max_pdf_mb: int = 25
 
-    # País a destacar (variantes en minúsculas)
+    # País a destacar
     highlight_country_names: List[str] = None
-
     def __post_init__(self):
         if self.highlight_country_names is None:
             self.highlight_country_names = ["españa", "spain"]
 
 
-# ---------------------------------------------------------------------
-# Agente
-# ---------------------------------------------------------------------
+# ----------------------------- Agent ---------------------------------
 
 class WeeklyReportAgent:
-    """
-    1) Localiza el último PDF (URL directa o dentro de la página de artículo).
-    2) Descarga, extrae, resume (LexRank con fallback), traduce (robusto a español).
-    3) Correo visual (puntos clave + bloques por enfermedad), resaltando España.
-    4) Evita duplicados guardando el último PDF enviado.
-    """
-
-    # Iconos por enfermedad (cosmética)
     ICONS: Dict[str, str] = {
-        "CCHF": "🧬",
-        "Influenza aviar": "🐦",
-        "Virus del Nilo Occidental": "🦟",
-        "Sarampión": "💉",
-        "Dengue": "🦟",
-        "Chikungunya": "🦟",
-        "Mpox": "🐒",
-        "Polio": "🧒",
-        "Gripe estacional": "🤧",
-        "COVID-19": "🦠",
-        "Tos ferina": "😮‍💨",
-        "Fiebre amarilla": "🟡",
-        "Fiebre tifoidea": "🍲",
+        "CCHF": "🧬", "Influenza aviar": "🐦", "Virus del Nilo Occidental": "🦟",
+        "Sarampión": "💉", "Dengue": "🦟", "Chikungunya": "🦟", "Mpox": "🐒",
+        "Polio": "🧒", "Gripe estacional": "🤧", "COVID-19": "🦠",
+        "Tos ferina": "😮‍💨", "Fiebre amarilla": "🟡", "Fiebre tifoidea": "🍲",
     }
-
     DISEASE_PATTERNS: Dict[str, re.Pattern] = {
         "CCHF": re.compile(r"\b(crimean[-\s]?congo|cchf)\b", re.I),
         "Influenza aviar": re.compile(r"\bavian|influenza\s+avian|h5n1|h7n9|h9n2\b", re.I),
@@ -178,48 +141,38 @@ class WeeklyReportAgent:
         )
         self.session = requests.Session()
         self.session.headers.update({
-            "User-Agent": (
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-            ),
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
             "Accept": "text/html,application/pdf,application/xhtml+xml,*/*;q=0.8",
         })
         from urllib3.util.retry import Retry
         adapter = requests.adapters.HTTPAdapter(
-            max_retries=Retry(
-                total=4,
-                backoff_factor=0.6,
-                status_forcelist=(429, 500, 502, 503, 504),
-                allowed_methods=frozenset(["HEAD", "GET"]),
-            )
+            max_retries=Retry(total=4, backoff_factor=0.6,
+                              status_forcelist=(429,500,502,503,504),
+                              allowed_methods=frozenset(["HEAD","GET"]))
         )
         self.session.mount("https://", adapter)
         self.session.mount("http://", adapter)
         self.translator = Translator() if Translator is not None else None
 
-    # ------------------------ Estado -----------------------------------
-
+    # ---------- State ----------
     def _load_state(self) -> Dict[str, Any]:
         try:
             if os.path.exists(self.config.state_path):
                 with open(self.config.state_path, "r", encoding="utf-8") as f:
                     return json.load(f)
         except Exception as e:
-            logging.warning("No se pudo leer state_path (%s): %s", self.config.state_path, e)
+            logging.warning("No se pudo leer state: %s", e)
         return {}
-
-    def _save_state(self, data: Dict[str, Any]) -> None:
+    def _save_state(self, d: Dict[str, Any]) -> None:
         try:
             with open(self.config.state_path, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
+                json.dump(d, f, ensure_ascii=False, indent=2)
         except Exception as e:
-            logging.warning("No se pudo guardar state_path (%s): %s", self.config.state_path, e)
+            logging.warning("No se pudo guardar state: %s", e)
 
-    # ------------------------ Helpers ----------------------------------
-
+    # ---------- Helpers ----------
     @staticmethod
     def _parse_week_year_from_text(s: str) -> Tuple[Optional[int], Optional[int]]:
-        # Normaliza: lowercase + decodifica %20 -> espacio, etc.
         s = unquote(s or "").lower()
         mw = re.search(r"week(?:[\s_\-]?)(\d{1,2})", s)
         wy = int(mw.group(1)) if mw else None
@@ -227,569 +180,416 @@ class WeeklyReportAgent:
         yy = int(my.group(1)) if my else None
         return wy, yy
 
-    # ------------------------ Localización del PDF ---------------------
-
+    # ---------- Find PDF ----------
     def _try_direct_weekly_pdf(self) -> Optional[Tuple[str, Optional[int], Optional[int]]]:
-        """URL directa por semana ISO; retrocede 6 semanas; prueba con y sin cero."""
         today = dt.date.today()
         year, week, _ = today.isocalendar()
-        for delta in range(0, 7):
+        for delta in range(0,7):
             w = week - delta
             y = year
             if w <= 0:
                 y = year - 1
-                last_week_prev_year = dt.date(y, 12, 28).isocalendar()[1]
-                w = last_week_prev_year + w
+                w = dt.date(y, 12, 28).isocalendar()[1] + w
             for wk in (str(w), str(w).zfill(2)):
                 url = self.config.direct_pdf_template.format(week=wk, year=y)
                 try:
                     h = self.session.head(url, timeout=12, allow_redirects=True)
-                    logging.debug("HEAD %s -> %s", url, getattr(h, "status_code", "?"))
-                    ct = h.headers.get("Content-Type", "").lower()
-                    if h.status_code == 200 and "pdf" in ct:
+                    if h.status_code == 200 and "pdf" in h.headers.get("Content-Type","").lower():
                         return url, int(wk), y
                 except requests.RequestException:
                     continue
         return None
 
     def _scan_listing_page(self) -> Optional[Tuple[str, Optional[int], Optional[int]]]:
-        """
-        Rastrea el listado, entra en artículos, encuentra el PDF y extrae week/year.
-        """
-        def fetch_pdf_from_article(url: str) -> Tuple[Optional[str], Optional[int], Optional[int], Optional[str]]:
+        def from_article(url: str):
             try:
-                r = self.session.get(url, timeout=20)
-                r.raise_for_status()
+                r = self.session.get(url, timeout=20); r.raise_for_status()
             except requests.RequestException:
                 return None, None, None, None
             soup = BeautifulSoup(r.text, "html.parser")
-            # Fecha (opcional)
-            published_iso = None
-            meta_pub = soup.find("meta", {"property": "article:published_time"}) or soup.find("time", {"itemprop": "datePublished"})
-            if meta_pub and meta_pub.get("content"):
-                published_iso = meta_pub["content"]
-            elif meta_pub and meta_pub.get("datetime"):
-                published_iso = meta_pub["datetime"]
-            # Primer PDF interno
             pdf_url = None
             for a in soup.find_all("a", href=True):
                 href = a["href"]
                 if href.lower().endswith(".pdf"):
                     if not href.startswith("http"):
                         href = requests.compat.urljoin(url, href)
-                    pdf_url = href
-                    break
-            full_text = " ".join([
-                soup.title.get_text(strip=True) if soup.title else "",
-                url,
-                pdf_url or ""
-            ])
-            w, y = self._parse_week_year_from_text(full_text)
+                    pdf_url = href; break
+            title = soup.title.get_text(strip=True) if soup.title else ""
+            w,y = self._parse_week_year_from_text(" ".join([title,url,pdf_url or ""]))
+            published_iso = None
+            meta = soup.find("meta", {"property":"article:published_time"}) or soup.find("time", {"itemprop":"datePublished"})
+            if meta and meta.get("content"): published_iso = meta["content"]
+            elif meta and meta.get("datetime"): published_iso = meta["datetime"]
             return pdf_url, w, y, published_iso
 
         try:
-            r = self.session.get(self.config.base_url, timeout=20)
-            r.raise_for_status()
+            r = self.session.get(self.config.base_url, timeout=20); r.raise_for_status()
         except requests.RequestException as e:
-            logging.warning("No se pudo cargar la página de listados: %s", e)
-            return None
+            logging.warning("Listado inaccesible: %s", e); return None
 
         soup = BeautifulSoup(r.text, "html.parser")
-        candidates: List[Tuple[int, int, str, Optional[str]]] = []
-        article_links: List[str] = []
-        direct_pdfs: List[str] = []
+        candidates: List[Tuple[int,int,str,Optional[str]]] = []
+        arts, pdfs = [], []
 
         for a in soup.find_all("a", href=True):
             href = a["href"]
-            if not href:
-                continue
             if not href.startswith("http"):
                 href = requests.compat.urljoin(self.config.base_url, href)
-            lch = href.lower()
-            if lch.endswith(".pdf") and "communicable-disease-threats-report" in lch:
-                direct_pdfs.append(href)
-            elif "communicable-disease-threats-report" in lch and ("/publications-data/" in lch or "/publications-and-data/" in lch):
-                article_links.append(href)
+            l = href.lower()
+            if l.endswith(".pdf") and "communicable-disease-threats-report" in l:
+                pdfs.append(href)
+            elif "communicable-disease-threats-report" in l and ("/publications-data/" in l or "/publications-and-data/" in l):
+                arts.append(href)
+        arts = arts[:15]
 
-        article_links = article_links[:15]  # limitar carga
-
-        # a) artículos
-        for art in article_links:
-            pdf_url, w, y, published_iso = fetch_pdf_from_article(art)
-            if w is None or y is None:
-                w2, y2 = self._parse_week_year_from_text(art)
-                if w is None:
-                    w = w2
-                if y is None:
-                    y = y2
-            if not pdf_url:
-                continue
-            ok = True
+        for art in arts:
+            pdf_url, w, y, pub = from_article(art)
+            if not pdf_url: continue
             try:
                 h = self.session.head(pdf_url, timeout=12, allow_redirects=True)
-                ct = h.headers.get("Content-Type", "").lower()
-                if h.status_code != 200 or "pdf" not in ct:
-                    ok = False
+                ok = (h.status_code==200 and "pdf" in h.headers.get("Content-Type","").lower())
             except requests.RequestException:
                 ok = True
             if ok:
-                if y is None:
-                    y = dt.date.today().year
+                if y is None: y = dt.date.today().year
                 w = w or 0
-                logging.debug("Artículo %s -> PDF %s | week=%s year=%s", art, pdf_url, w, y)
-                candidates.append((y, w, pdf_url, published_iso))
+                candidates.append((y,w,pdf_url,pub))
 
-        # b) PDFs directos del listado
-        for href in direct_pdfs:
-            w, y = self._parse_week_year_from_text(href)
-            if y is None:
-                y = dt.date.today().year
-            w = w or 0
-            candidates.append((y, w, href, None))
+        for href in pdfs:
+            w,y = self._parse_week_year_from_text(href)
+            if y is None: y = dt.date.today().year
+            candidates.append((y, w or 0, href, None))
 
         if not candidates:
             return None
 
-        # Orden principal
-        candidates.sort(key=lambda t: (t[0], t[1]), reverse=True)
-
-        # Si el top no trae week, desempatar por fecha publicación
-        top_year, top_week, _, _ = candidates[0]
-        if top_week == 0:
-            def published_key(iso: Optional[str]) -> float:
+        candidates.sort(key=lambda t:(t[0],t[1]), reverse=True)
+        if candidates[0][1]==0:
+            def key_pub(iso):
                 try:
                     from datetime import datetime
-                    return datetime.fromisoformat((iso or "").replace("Z", "+00:00")).timestamp()
+                    return datetime.fromisoformat((iso or "").replace("Z","+00:00")).timestamp()
                 except Exception:
                     return 0.0
-            candidates.sort(key=lambda t: published_key(t[3]), reverse=True)
+            candidates.sort(key=lambda t:key_pub(t[3]), reverse=True)
 
-        best_y, best_w, best_pdf, _ = candidates[0]
-        best_w = best_w if best_w != 0 else None
-        return best_pdf, best_w, best_y
+        y,w,pdf,_ = candidates[0]
+        return pdf, (w if w!=0 else None), y
 
-    def fetch_latest_pdf(self) -> Optional[Tuple[str, Optional[int], Optional[int]]]:
+    def fetch_latest_pdf(self):
         a = self._try_direct_weekly_pdf()
         b = self._scan_listing_page()
-        def key(t: Optional[Tuple[str, Optional[int], Optional[int]]]) -> Tuple[int, int]:
-            if not t:
-                return (0, 0)
-            _, w, y = t
-            return (y or 0, w or 0)
-        best = max([x for x in (a, b) if x], key=key, default=None)
-        if best:
-            url, w, y = best
-            logging.info("%s seleccionado: %s (week=%s, year=%s)",
-                         "PDF directo" if best == a else "PDF de artículo", url, w, y)
-        return best
+        def key(t): 
+            if not t: return (0,0)
+            _,w,y = t; return (y or 0, w or 0)
+        return max([x for x in (a,b) if x], key=key, default=None)
 
-    # --------------------- Descarga / extracción -----------------------
-
+    # ---------- Download & extract ----------
     def download_pdf(self, pdf_url: str, dest_path: str, max_mb: int = 25) -> None:
-        def _append_download_param(url: str) -> str:
-            return url + ("&download=1" if "?" in url else "?download=1")
-        def _looks_like_pdf(first_bytes: bytes) -> bool:
-            return first_bytes.startswith(b"%PDF")
+        def looks_pdf(b: bytes) -> bool: return b.startswith(b"%PDF")
         try:
             h = self.session.head(pdf_url, timeout=15, allow_redirects=True)
-            clen = h.headers.get("Content-Length")
-            if clen and int(clen) > max_mb * 1024 * 1024:
-                raise RuntimeError(f"El PDF excede {max_mb} MB ({int(clen)/1024/1024:.1f} MB)")
+            if (cl:=h.headers.get("Content-Length")) and int(cl)>max_mb*1024*1024:
+                raise RuntimeError("PDF demasiado grande")
         except requests.RequestException:
             pass
-        headers = {"Accept": "application/pdf", "Referer": self.config.base_url, "Cache-Control": "no-cache"}
-        def _try_get(url: str) -> Tuple[str, Optional[str], bytes]:
+        headers = {"Accept":"application/pdf","Referer":self.config.base_url,"Cache-Control":"no-cache"}
+        def _get(url: str):
             r = self.session.get(url, headers=headers, stream=True, timeout=45, allow_redirects=True)
             r.raise_for_status()
-            ct = r.headers.get("Content-Type", "")
-            it = r.iter_content(chunk_size=8192)
-            first = next(it, b"")
+            it = r.iter_content(8192); first = next(it, b"")
             with open(dest_path, "wb") as f:
-                if first:
-                    f.write(first)
-                for chunk in it:
-                    if chunk:
-                        f.write(chunk)
-            return ct, r.headers.get("Content-Length"), first
+                if first: f.write(first)
+                for ch in it:
+                    if ch: f.write(ch)
+            return r.headers.get("Content-Type",""), first
         try:
-            ct, clen, first = _try_get(pdf_url)
-            logging.debug("GET %s -> Content-Type=%s, len=%s", pdf_url, ct, clen)
-            if ("pdf" in (ct or "").lower()) and _looks_like_pdf(first):
-                return
-            logging.info("Respuesta no-PDF. Reintentando con ?download=1 ...")
-        except requests.RequestException as e:
-            logging.info("GET inicial falló (%s). Reintentamos con ?download=1 ...", e)
-        retry_url = _append_download_param(pdf_url)
-        ct2, clen2, first2 = _try_get(retry_url)
-        logging.debug("GET %s -> Content-Type=%s, len=%s", retry_url, ct2, clen2)
-        if ("pdf" in (ct2 or "").lower()) and _looks_like_pdf(first2):
-            return
-        raise RuntimeError(f"No se obtuvo un PDF válido (Content-Type={ct2!r}, firma={first2[:8]!r}).")
+            ct, first = _get(pdf_url)
+            if "pdf" in ct.lower() and looks_pdf(first): return
+        except requests.RequestException:
+            pass
+        q = pdf_url + ("&download=1" if "?" in pdf_url else "?download=1")
+        ct, first = _get(q)
+        if not ("pdf" in ct.lower() and looks_pdf(first)):
+            raise RuntimeError("No se obtuvo PDF válido")
 
     def extract_text(self, pdf_path: str) -> str:
         try:
-            parts = []
+            parts=[]
             with pdfplumber.open(pdf_path) as pdf:
-                for page in pdf.pages:
-                    parts.append(page.extract_text() or "")
+                for p in pdf.pages:
+                    parts.append(p.extract_text() or "")
             return "\n".join(parts)
-        except Exception as e:
-            logging.warning("Fallo pdfplumber: %s. Probando pdfminer...", e)
+        except Exception:
             if pm_extract:
                 try:
                     return pm_extract(pdf_path)
-                except Exception as pm_e:
-                    logging.error("Fallo pdfminer: %s", pm_e)
+                except Exception:
                     return ""
-            logging.error("pdfminer no disponible.")
             return ""
 
-    # -------------------------- Sumario --------------------------------
-
+    # ---------- Summarize & translate ----------
     def summarize(self, text: str, sentences: int) -> str:
-        if not text.strip():
-            return ""
+        if not text.strip(): return ""
         if _ensure_nltk_resources():
             try:
                 parser = PlaintextParser.from_string(text, Tokenizer("english"))
-                summarizer = LexRankSummarizer()
-                sents = summarizer(parser.document, max(1, sentences))
-                out = " ".join(str(s) for s in sents)
-                if out.strip():
-                    return out
-            except Exception as e:
-                logging.warning("LexRank falló; uso fallback: %s", e)
-        else:
-            logging.info("NLTK no disponible; uso fallback.")
+                s = LexRankSummarizer()(parser.document, max(1, sentences))
+                out = " ".join(str(x) for x in s)
+                if out.strip(): return out
+            except Exception: pass
         return _simple_extractive_summary(text, sentences)
 
-    # ------------------------- Traducción -------------------------------
-
     def translate_to_spanish(self, text: str) -> str:
-        """Traduce al español con dos intentos (googletrans -> endpoint público)."""
-        if not text.strip():
-            return ""
-        # 1) googletrans (si está)
+        if not text.strip(): return ""
         if self.translator:
             try:
                 res = self.translator.translate(text, src="en", dest="es")
-                if res and res.text:
-                    return res.text
-            except Exception as e:
-                logging.warning("googletrans falló: %s", e)
-        # 2) Endpoint público de Google Translate
+                if res and res.text: return res.text
+            except Exception: pass
         try:
             url = "https://translate.googleapis.com/translate_a/single"
-            params = {"client": "gtx", "sl": "en", "tl": "es", "dt": "t", "q": text}
-            r = self.session.get(url, params=params, timeout=12)
-            r.raise_for_status()
-            data = r.json()
-            segs = [seg[0] for seg in (data[0] or []) if seg and seg[0]]
-            out = " ".join(segs).strip()
-            if out:
-                return out
-        except Exception as e:
-            logging.warning("Fallback Google Translate falló: %s", e)
-        # Último recurso: original
-        return text
+            r = self.session.get(url, params={"client":"gtx","sl":"en","tl":"es","dt":"t","q":text}, timeout=12)
+            r.raise_for_status(); data = r.json()
+            return " ".join(seg[0] for seg in (data[0] or []) if seg and seg[0]).strip() or text
+        except Exception:
+            return text
 
-    # --------------------- Formato visual del correo -------------------
-
+    # ---------- Formatting helpers ----------
     @staticmethod
     def _split_sentences(text: str) -> List[str]:
-        parts = re.split(r'(?<=[.!?])\s+', text.strip())
-        return [p.strip() for p in parts if p.strip()]
+        return [p.strip() for p in re.split(r'(?<=[.!?])\s+', text.strip()) if p.strip()]
 
     def _highlight_entities(self, s: str) -> str:
-        # Negritas para enfermedades + países en verde
         s_html = s
         for _, pat in self.DISEASE_PATTERNS.items():
             s_html = pat.sub(lambda m: f"<strong style='color:#8b0000'>{m.group(0)}</strong>", s_html)
-        country_list = [
-            "spain","france","italy","germany","portugal","greece","poland","romania","netherlands","belgium",
-            "sweden","norway","finland","denmark","ireland","uk","united kingdom","austria","czech","hungary",
-            "bulgaria","croatia","estonia","latvia","lithuania","slovakia","slovenia","switzerland","iceland",
-            "turkey","cyprus","malta","ukraine","russia","georgia","moldova","serbia","bosnia","albania",
-            "montenegro","north macedonia"
-        ]
-        for c in country_list:
+        countries = ["spain","france","italy","germany","portugal","greece","poland","romania","netherlands","belgium",
+                     "sweden","norway","finland","denmark","ireland","uk","united kingdom","austria","czech","hungary",
+                     "bulgaria","croatia","estonia","latvia","lithuania","slovakia","slovenia","switzerland","iceland",
+                     "turkey","cyprus","malta","ukraine","russia","georgia","moldova","serbia","bosnia","albania",
+                     "montenegro","north macedonia"]
+        for c in countries:
             s_html = re.sub(rf"\b{re.escape(c)}\b", lambda m: f"<span style='color:#0b6e0b;font-weight:600'>{m.group(0).title()}</span>", s_html, flags=re.I)
         return s_html
 
     def _highlight_priority_country(self, s_html: str) -> str:
-        """Resalta España/Espain si aparece."""
-        lower = re.sub(r"<[^>]+>", "", s_html).lower()  # quitar tags para chequeo
-        if any(name in lower for name in self.config.highlight_country_names):
-            return (
-                "🇪🇸 "
-                "<span style='background:#fff7d6;padding:2px 4px;border-radius:4px;"
-                "border-left:4px solid #ff9800'>"
-                f"{s_html}"
-                "</span>"
-            )
+        plain = re.sub(r"<[^>]+>", "", s_html).lower()
+        if any(name in plain for name in self.config.highlight_country_names):
+            return ("🇪🇸 <span style='background:#fff7d6;padding:2px 4px;border-radius:4px;"
+                    "border-left:4px solid #ff9800'>" f"{s_html}</span>")
         return s_html
 
-    def format_summary_to_html(self, summary_es: str) -> Tuple[str, str]:
-        """
-        Devuelve (html_keypoints, html_by_disease)
-        - html_keypoints: lista <li> con primeras N frases
-        - html_by_disease: tabla por enfermedad con frases relevantes
-        """
+    # ---- NEW: titulares (headline cards) ----
+    @staticmethod
+    def _split_headline(sentence: str, max_title_chars: int = 140) -> Tuple[str, str]:
+        """Extrae un 'titular' corto y deja el resto como 'desarrollo'."""
+        s = sentence.strip()
+        # Cortar por primera pausa natural
+        m = re.search(r"[:;—–\-]|\.\s", s)
+        if m and m.start() <= max_title_chars:
+            title = s[:m.start()].strip()
+            body = s[m.end():].strip()
+        else:
+            if len(s) > max_title_chars:
+                title = s[:max_title_chars].rsplit(" ",1)[0] + "…"
+                body = s[len(title):].strip()
+            else:
+                title, body = s, ""
+        return title, body
+
+    def render_headline_cards(self, sentences: List[str], n_cards: int = 3) -> str:
+        cards = []
+        for s in sentences[:n_cards]:
+            title, body = self._split_headline(s)
+            title_html = self._highlight_priority_country(self._highlight_entities(title))
+            body_html  = self._highlight_priority_country(self._highlight_entities(body)) if body else ""
+            cards.append(
+                "<tr><td style='padding:0 20px'>"
+                "<table role='presentation' width='100%' cellspacing='0' cellpadding='0' "
+                "style='margin:10px 0;border-left:5px solid #0b5cab;background:#f6f9ff;border-radius:8px'>"
+                "<tr><td style='padding:12px 14px'>"
+                f"<div style='font-size:16px;font-weight:800;color:#0b5cab;margin-bottom:4px'>{title_html}</div>"
+                f"{(f\"<div style='font-size:14px;color:#333;opacity:.9'>{body_html}</div>\" if body_html else '')}"
+                "</td></tr></table>"
+                "</td></tr>"
+            )
+        return "".join(cards)
+
+    # ---------- Build sections ----------
+    def format_summary_to_html(self, summary_es: str) -> Tuple[str, str, str]:
         sentences = self._split_sentences(summary_es)
-        # Puntos clave = primeras 6 frases
-        keypoints = sentences[:6]
+
+        # Titulares: primeras 2–3 frases
+        headlines_html = self.render_headline_cards(sentences, n_cards=3)
+
+        # Puntos clave: siguientes 6
+        keypoints = sentences[3:9] if len(sentences) > 3 else sentences[:6]
         lis = []
         for s in keypoints:
-            item = self._highlight_entities(s)
-            item = self._highlight_priority_country(item)
+            item = self._highlight_priority_country(self._highlight_entities(s))
             lis.append(f"<li style='margin:6px 0'>{item}</li>")
-        html_keypoints = "\n".join(lis) if lis else "<li>Sin datos destacados.</li>"
+        html_keypoints = "<ul style='padding-left:18px;margin:0'>" + ("".join(lis) if lis else "<li>Sin datos destacados.</li>") + "</ul>"
 
-        # Agrupar por enfermedad
+        # Detalle por enfermedad
         buckets: Dict[str, List[str]] = {k: [] for k in self.DISEASE_PATTERNS.keys()}
         others: List[str] = []
         for s in sentences:
             placed = False
             for name, pat in self.DISEASE_PATTERNS.items():
                 if pat.search(s):
-                    item = self._highlight_entities(s)
-                    item = self._highlight_priority_country(item)
-                    buckets[name].append(item)
+                    buckets[name].append(self._highlight_priority_country(self._highlight_entities(s)))
                     placed = True
             if not placed:
-                item = self._highlight_entities(s)
-                item = self._highlight_priority_country(item)
-                others.append(item)
+                others.append(self._highlight_priority_country(self._highlight_entities(s)))
 
         sections = []
         for name, items in buckets.items():
-            if not items:
-                continue
+            if not items: continue
             icon = self.ICONS.get(name, "•")
             items_html = "".join(f"<li style='margin:4px 0'>{it}</li>" for it in items[:6])
-            block = (
-                "<tr>"
-                "<td style='padding:12px 14px;border-bottom:1px solid #eee'>"
+            sections.append(
+                "<tr><td style='padding:12px 14px;border-bottom:1px solid #eee'>"
                 f"<div style='font-weight:700;color:#333;margin-bottom:6px'>{icon} {name}</div>"
                 f"<ul style='padding-left:18px;margin:0'>{items_html}</ul>"
-                "</td>"
-                "</tr>"
+                "</td></tr>"
             )
-            sections.append(block)
         if others:
             items_html = "".join(f"<li style='margin:4px 0'>{it}</li>" for it in others[:6])
-            block = (
-                "<tr>"
-                "<td style='padding:12px 14px;border-bottom:1px solid #eee'>"
+            sections.append(
+                "<tr><td style='padding:12px 14px;border-bottom:1px solid #eee'>"
                 "<div style='font-weight:700;color:#333;margin-bottom:6px'>Otros</div>"
                 f"<ul style='padding-left:18px;margin:0'>{items_html}</ul>"
-                "</td>"
-                "</tr>"
+                "</td></tr>"
             )
-            sections.append(block)
-
         html_by_disease = "\n".join(sections) if sections else ""
-        return f"<ul style='padding-left:18px;margin:0'>{html_keypoints}</ul>", html_by_disease
+        return headlines_html, html_keypoints, html_by_disease
 
-    # ------------------------- Construcción HTML -----------------------
-
+    # ---------- Email HTML ----------
     def build_html(self, summary_es: str, pdf_url: str, week: Optional[int], year: Optional[int]) -> str:
-        keypoints_html, by_disease_html = self.format_summary_to_html(summary_es)
+        headlines_html, keypoints_html, by_disease_html = self.format_summary_to_html(summary_es)
         title_week = f"Semana {week} · {year}" if week and year else "Último informe ECDC"
 
-        # Bloque condicional para el detalle por enfermedad
         detail_block = ""
         if by_disease_html:
             divider = "<tr><td style='padding:0 20px 6px'><div style='height:1px;background:#eee'></div></td></tr>"
             detail_block = (
                 f"{divider}"
-                "<tr>"
-                "<td style='padding:6px 20px 14px'>"
+                "<tr><td style='padding:6px 20px 14px'>"
                 "<div style='font-weight:700;color:#333;margin-bottom:8px'>Detalle por enfermedad</div>"
                 "<table role='presentation' width='100%' cellspacing='0' cellpadding='0' "
                 "style='border:1px solid #f0f0f0;border-radius:8px;overflow:hidden'>"
                 f"{by_disease_html}"
                 "</table>"
-                "</td>"
-                "</tr>"
+                "</td></tr>"
             )
 
         return (
-            "<html>"
-            "<body style='margin:0;padding:0;background:#f5f7fb'>"
+            "<html><body style='margin:0;padding:0;background:#f5f7fb'>"
             "<table role='presentation' width='100%' cellspacing='0' cellpadding='0' style='background:#f5f7fb;padding:18px 12px'>"
             "<tr><td align='center'>"
             "<table role='presentation' width='680' cellspacing='0' cellpadding='0' style='max-width:680px;background:#ffffff;border-radius:10px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,.06)'>"
-            "<tr>"
-            "<td style='background:#0b5cab;color:#fff;padding:18px 20px'>"
+            "<tr><td style='background:#0b5cab;color:#fff;padding:18px 20px'>"
             "<div style='font-size:20px;font-weight:700'>Boletín semanal de amenazas sanitarias</div>"
             f"<div style='opacity:.9;font-size:14px;margin-top:4px'>{title_week}</div>"
-            "</td>"
-            "</tr>"
-            "<tr>"
-            "<td style='padding:18px 20px'>"
+            "</td></tr>"
+            # Titulares
+            f"{headlines_html}"
+            # Puntos clave
+            "<tr><td style='padding:12px 20px'>"
             "<div style='font-weight:700;color:#333;margin-bottom:8px'>Puntos clave</div>"
             f"{keypoints_html}"
-            "</td>"
-            "</tr>"
-            f"{detail_block}"
-            "<tr>"
-            "<td align='center' style='padding:8px 20px 22px'>"
-            f"<a href='{pdf_url}' style='display:inline-block;background:#0b5cab;color:#fff;text-decoration:none;padding:10px 16px;border-radius:8px;font-weight:700'>Abrir informe completo (PDF)</a>"
-            "</td>"
-            "</tr>"
-            "<tr>"
-            "<td style='background:#f3f4f6;color:#6b7280;padding:12px 20px;font-size:12px;text-align:center'>"
-            f"Generado automáticamente · {dt.datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}"
-            "</td>"
-            "</tr>"
-            "</table>"
             "</td></tr>"
-            "</table>"
-            "</body>"
-            "</html>"
+            # Detalle
+            f"{detail_block}"
+            # Botón
+            "<tr><td align='center' style='padding:8px 20px 22px'>"
+            f"<a href='{pdf_url}' style='display:inline-block;background:#0b5cab;color:#fff;text-decoration:none;padding:10px 16px;border-radius:8px;font-weight:700'>Abrir informe completo (PDF)</a>"
+            "</td></tr>"
+            "<tr><td style='background:#f3f4f6;color:#6b7280;padding:12px 20px;font-size:12px;text-align:center'>"
+            f"Generado automáticamente · {dt.datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}"
+            "</td></tr>"
+            "</table></td></tr></table></body></html>"
         )
 
-    # ------------------------- Envío -----------------------------------
-
+    # ---------- Send ----------
     def send_email(self, subject: str, plain: str, html: Optional[str] = None) -> None:
         if not self.config.sender_email or not self.config.receiver_email:
             raise ValueError("Faltan SENDER_EMAIL o RECEIVER_EMAIL.")
         if not self.config.smtp_server:
             raise ValueError("Falta SMTP_SERVER.")
-
         msg = EmailMessage()
-        msg["Subject"] = subject
-        msg["From"] = self.config.sender_email
-        msg["To"] = self.config.receiver_email
+        msg["Subject"] = subject; msg["From"] = self.config.sender_email; msg["To"] = self.config.receiver_email
         msg.set_content(plain or "(vacío)")
-        if html:
-            msg.add_alternative(html, subtype="html")
+        if html: msg.add_alternative(html, subtype="html")
+        ctx = ssl.create_default_context()
+        if self.config.smtp_port == 465:
+            with smtplib.SMTP_SSL(self.config.smtp_server, self.config.smtp_port, context=ctx) as s:
+                s.ehlo(); 
+                if self.config.email_password: s.login(self.config.sender_email, self.config.email_password)
+                s.send_message(msg)
+        else:
+            with smtplib.SMTP(self.config.smtp_server, self.config.smtp_port, timeout=30) as s:
+                s.ehlo(); s.starttls(context=ctx); s.ehlo()
+                if self.config.email_password: s.login(self.config.sender_email, self.config.email_password)
+                s.send_message(msg)
+        logging.info("Correo enviado correctamente.")
 
-        context = ssl.create_default_context()
-        try:
-            if self.config.smtp_port == 465:
-                logging.debug("SMTP: SSL (465) a %s ...", self.config.smtp_server)
-                with smtplib.SMTP_SSL(self.config.smtp_server, self.config.smtp_port, context=context) as server:
-                    server.ehlo()
-                    if self.config.email_password:
-                        server.login(self.config.sender_email, self.config.email_password)
-                    server.send_message(msg)
-            else:
-                logging.debug("SMTP: STARTTLS (%s) a %s ...", self.config.smtp_port, self.config.smtp_server)
-                with smtplib.SMTP(self.config.smtp_server, self.config.smtp_port, timeout=30) as server:
-                    server.ehlo()
-                    server.starttls(context=context)
-                    server.ehlo()
-                    if self.config.email_password:
-                        server.login(self.config.sender_email, self.config.email_password)
-                    server.send_message(msg)
-            logging.info("Correo enviado correctamente.")
-        except Exception as e:
-            logging.exception("Error enviando email: %s", e)
-            raise
-
-    # --------------------------- Run -----------------------------------
-
+    # ---------- Run ----------
     def run(self) -> None:
         found = self.fetch_latest_pdf()
         if not found:
-            logging.info("No hay PDF nuevo o no se encontró ninguno.")
-            return
-
+            logging.info("No hay PDF nuevo."); return
         pdf_url, week, year = found
 
-        # Evitar duplicados
         state = self._load_state()
-        last_url = state.get("last_pdf_url")
-        if last_url == pdf_url and not self.config.force_send:
-            logging.info("PDF ya enviado previamente y FORCE_SEND!=1. No se reenvía. (%s)", pdf_url)
-            return
+        if state.get("last_pdf_url")==pdf_url and not self.config.force_send:
+            logging.info("PDF ya enviado. No se reenvía."); return
 
-        tmp_path = ""
-        text = ""
+        tmp_path, text = "", ""
         try:
             with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
                 tmp_path = tmp.name
-
-            try:
-                self.download_pdf(pdf_url, tmp_path, max_mb=self.config.max_pdf_mb)
-            except Exception as e:
-                logging.exception("Fallo descargando el PDF: %s", e)
-                return
-
-            try:
-                text = self.extract_text(tmp_path) or ""
-            except Exception as e:
-                logging.exception("Fallo extrayendo texto: %s", e)
-                text = ""
+            self.download_pdf(pdf_url, tmp_path, max_mb=self.config.max_pdf_mb)
+            text = self.extract_text(tmp_path) or ""
         finally:
             if tmp_path:
                 for _ in range(3):
-                    try:
-                        os.remove(tmp_path)
-                        break
-                    except Exception:
-                        time.sleep(0.2)
-
+                    try: os.remove(tmp_path); break
+                    except Exception: time.sleep(0.2)
         if not text.strip():
-            logging.warning("El PDF no contiene texto extraíble.")
-            return
+            logging.warning("PDF sin texto extraíble."); return
 
-        try:
-            summary_en = self.summarize(text, self.config.summary_sentences)
-        except Exception as e:
-            logging.exception("Fallo generando el resumen: %s", e)
-            return
+        summary_en = self.summarize(text, self.config.summary_sentences)
         if not summary_en.strip():
-            logging.warning("No se pudo generar resumen.")
-            return
+            logging.warning("No se pudo generar resumen."); return
 
-        try:
-            summary_es = self.translate_to_spanish(summary_en)
-        except Exception as e:
-            logging.exception("Fallo traduciendo, envío el original en inglés: %s", e)
-            summary_es = summary_en
+        summary_es = self.translate_to_spanish(summary_en)
 
-        # HTML visual + asunto + plain text
         html = self.build_html(summary_es, pdf_url, week, year)
         subject = f"ECDC CDTR – Semana {week} ({year})" if week and year else "Resumen del informe semanal del ECDC"
 
-        plain_sentences = self._split_sentences(summary_es)[:8]
-        plain = "Boletín semanal de amenazas sanitarias\n" + \
-                (f"Semana {week} · {year}\n\n" if week and year else "\n") + \
-                "\n- ".join([""] + plain_sentences) + \
-                f"\n\nInforme completo: {pdf_url}"
+        # Plain text: titulares + link
+        sentences = self._split_sentences(summary_es)
+        plain = "Boletín semanal de amenazas sanitarias\n" + (f"Semana {week} · {year}\n\n" if week and year else "\n")
+        for s in sentences[:3]:
+            title,_ = self._split_headline(s)
+            plain += f"- {title}\n"
+        plain += f"\nInforme completo: {pdf_url}"
 
         if self.config.dry_run:
-            logging.info("DRY_RUN=1: no se envía email. Asunto: %s", subject)
-            logging.debug("Resumen ES (plain):\n%s", plain)
-            return
+            logging.info("DRY_RUN=1: no se envía email. Asunto: %s", subject); return
 
-        try:
-            self.send_email(subject, plain, html)
-        except Exception as e:
-            logging.exception("Fallo enviando el email: %s", e)
-            return
-
-        # Guardar estado
-        state.update({
-            "last_pdf_url": pdf_url,
-            "last_week": week,
-            "last_year": year,
-            "last_sent_utc": dt.datetime.utcnow().isoformat() + "Z",
-        })
+        self.send_email(subject, plain, html)
+        state.update({"last_pdf_url": pdf_url, "last_week": week, "last_year": year, "last_sent_utc": dt.datetime.utcnow().isoformat()+"Z"})
         self._save_state(state)
 
 
-# ---------------------------------------------------------------------
-# main
-# ---------------------------------------------------------------------
+# ----------------------------- main ----------------------------------
 
 def main() -> None:
     cfg = Config()
-    agent = WeeklyReportAgent(cfg)
-    agent.run()
+    WeeklyReportAgent(cfg).run()
 
 if __name__ == "__main__":
     main()
