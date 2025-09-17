@@ -25,12 +25,9 @@ from bs4 import BeautifulSoup
 # PDF
 import pdfplumber  # type: ignore
 try:
-    from pdfminer_high_level import extract_text as pm_extract  # type: ignore
+    from pdfminer.high_level import extract_text as pm_extract  # type: ignore
 except Exception:
-    try:
-        from pdfminer.high_level import extract_text as pm_extract  # type: ignore
-    except Exception:
-        pm_extract = None  # type: ignore
+    pm_extract = None  # type: ignore
 
 # Sumario
 from sumy.parsers.plaintext import PlaintextParser
@@ -49,7 +46,7 @@ except Exception:
 # ---------------------------------------------------------------------
 
 def _ensure_nltk_resources() -> bool:
-    """Garantiza recursos NLTK (punkt/punkt_tab) si están disponibles; si falla, devolvemos False."""
+    """Intenta garantizar recursos NLTK; si falla, devolvemos False (se usará fallback)."""
     try:
         import nltk
         try:
@@ -119,6 +116,13 @@ class Config:
     log_level: str = os.getenv("LOG_LEVEL", "INFO")
     max_pdf_mb: int = 25
 
+    # País a destacar (variantes en minúsculas)
+    highlight_country_names: List[str] = None
+
+    def __post_init__(self):
+        if self.highlight_country_names is None:
+            self.highlight_country_names = ["españa", "spain"]
+
 
 # ---------------------------------------------------------------------
 # Agente
@@ -127,10 +131,43 @@ class Config:
 class WeeklyReportAgent:
     """
     1) Localiza el último PDF (URL directa o dentro de la página de artículo).
-    2) Descarga, extrae, resume (LexRank con fallback), traduce (opcional).
-    3) Genera correo con HTML visual (puntos clave + secciones por enfermedad) y lo envía.
+    2) Descarga, extrae, resume (LexRank con fallback), traduce (robusto a español).
+    3) Correo visual (puntos clave + bloques por enfermedad), resaltando España.
     4) Evita duplicados guardando el último PDF enviado.
     """
+
+    # Iconos por enfermedad (cosmética)
+    ICONS: Dict[str, str] = {
+        "CCHF": "🧬",
+        "Influenza aviar": "🐦",
+        "Virus del Nilo Occidental": "🦟",
+        "Sarampión": "💉",
+        "Dengue": "🦟",
+        "Chikungunya": "🦟",
+        "Mpox": "🐒",
+        "Polio": "🧒",
+        "Gripe estacional": "🤧",
+        "COVID-19": "🦠",
+        "Tos ferina": "😮‍💨",
+        "Fiebre amarilla": "🟡",
+        "Fiebre tifoidea": "🍲",
+    }
+
+    DISEASE_PATTERNS: Dict[str, re.Pattern] = {
+        "CCHF": re.compile(r"\b(crimean[-\s]?congo|cchf)\b", re.I),
+        "Influenza aviar": re.compile(r"\bavian|influenza\s+avian|h5n1|h7n9|h9n2\b", re.I),
+        "Virus del Nilo Occidental": re.compile(r"\bwest nile|wnv\b", re.I),
+        "Sarampión": re.compile(r"\bmeasles\b", re.I),
+        "Dengue": re.compile(r"\bdengue\b", re.I),
+        "Chikungunya": re.compile(r"\bchikungunya\b", re.I),
+        "Mpox": re.compile(r"\bmpox|monkeypox\b", re.I),
+        "Polio": re.compile(r"\b(polio|poliomyelitis|vdpv|wpv)\b", re.I),
+        "Gripe estacional": re.compile(r"\b(influenza(?!\s*avian)|flu)\b", re.I),
+        "COVID-19": re.compile(r"\bcovid|sars[-\s]?cov[-\s]?2\b", re.I),
+        "Tos ferina": re.compile(r"\b(pertussis|whooping\s+cough)\b", re.I),
+        "Fiebre amarilla": re.compile(r"\byellow fever\b", re.I),
+        "Fiebre tifoidea": re.compile(r"\btyphoid\b", re.I),
+    }
 
     def __init__(self, config: Config) -> None:
         self.config = config
@@ -193,6 +230,7 @@ class WeeklyReportAgent:
     # ------------------------ Localización del PDF ---------------------
 
     def _try_direct_weekly_pdf(self) -> Optional[Tuple[str, Optional[int], Optional[int]]]:
+        """URL directa por semana ISO; retrocede 6 semanas; prueba con y sin cero."""
         today = dt.date.today()
         year, week, _ = today.isocalendar()
         for delta in range(0, 7):
@@ -425,23 +463,37 @@ class WeeklyReportAgent:
             logging.info("NLTK no disponible; uso fallback.")
         return _simple_extractive_summary(text, sentences)
 
-    # --------------------- Formato visual del correo -------------------
+    # ------------------------- Traducción -------------------------------
 
-    DISEASE_PATTERNS: Dict[str, re.Pattern] = {
-        "CCHF": re.compile(r"\b(crimean[-\s]?congo|cchf)\b", re.I),
-        "Influenza aviar": re.compile(r"\bavian|influenza\s+avian|h5n1|h7n9|h9n2\b", re.I),
-        "Virus del Nilo Occidental": re.compile(r"\bwest nile|wnv\b", re.I),
-        "Sarampión": re.compile(r"\bmeasles\b", re.I),
-        "Dengue": re.compile(r"\bdengue\b", re.I),
-        "Chikungunya": re.compile(r"\bchikungunya\b", re.I),
-        "Mpox": re.compile(r"\bmpox|monkeypox\b", re.I),
-        "Polio": re.compile(r"\b(polio|poliomyelitis|vdpv|wpv)\b", re.I),
-        "Gripe estacional": re.compile(r"\b(influenza(?!\s*avian)|flu)\b", re.I),
-        "COVID-19": re.compile(r"\bcovid|sars[-\s]?cov[-\s]?2\b", re.I),
-        "Tos ferina": re.compile(r"\b(pertussis|whooping\s+cough)\b", re.I),
-        "Fiebre amarilla": re.compile(r"\byellow fever\b", re.I),
-        "Fiebre tifoidea": re.compile(r"\btyphoid\b", re.I),
-    }
+    def translate_to_spanish(self, text: str) -> str:
+        """Traduce al español con dos intentos (googletrans -> endpoint público)."""
+        if not text.strip():
+            return ""
+        # 1) googletrans (si está)
+        if self.translator:
+            try:
+                res = self.translator.translate(text, src="en", dest="es")
+                if res and res.text:
+                    return res.text
+            except Exception as e:
+                logging.warning("googletrans falló: %s", e)
+        # 2) Endpoint público de Google Translate
+        try:
+            url = "https://translate.googleapis.com/translate_a/single"
+            params = {"client": "gtx", "sl": "en", "tl": "es", "dt": "t", "q": text}
+            r = self.session.get(url, params=params, timeout=12)
+            r.raise_for_status()
+            data = r.json()
+            segs = [seg[0] for seg in (data[0] or []) if seg and seg[0]]
+            out = " ".join(segs).strip()
+            if out:
+                return out
+        except Exception as e:
+            logging.warning("Fallback Google Translate falló: %s", e)
+        # Último recurso: original
+        return text
+
+    # --------------------- Formato visual del correo -------------------
 
     @staticmethod
     def _split_sentences(text: str) -> List[str]:
@@ -449,6 +501,7 @@ class WeeklyReportAgent:
         return [p.strip() for p in parts if p.strip()]
 
     def _highlight_entities(self, s: str) -> str:
+        # Negritas para enfermedades + países en verde
         s_html = s
         for _, pat in self.DISEASE_PATTERNS.items():
             s_html = pat.sub(lambda m: f"<strong style='color:#8b0000'>{m.group(0)}</strong>", s_html)
@@ -463,50 +516,78 @@ class WeeklyReportAgent:
             s_html = re.sub(rf"\b{re.escape(c)}\b", lambda m: f"<span style='color:#0b6e0b;font-weight:600'>{m.group(0).title()}</span>", s_html, flags=re.I)
         return s_html
 
+    def _highlight_priority_country(self, s_html: str) -> str:
+        """Resalta España/Espain si aparece."""
+        lower = re.sub(r"<[^>]+>", "", s_html).lower()  # quitar tags para chequeo
+        if any(name in lower for name in self.config.highlight_country_names):
+            return (
+                "🇪🇸 "
+                "<span style='background:#fff7d6;padding:2px 4px;border-radius:4px;"
+                "border-left:4px solid #ff9800'>"
+                f"{s_html}"
+                "</span>"
+            )
+        return s_html
+
     def format_summary_to_html(self, summary_es: str) -> Tuple[str, str]:
+        """
+        Devuelve (html_keypoints, html_by_disease)
+        - html_keypoints: lista <li> con primeras N frases
+        - html_by_disease: tabla por enfermedad con frases relevantes
+        """
         sentences = self._split_sentences(summary_es)
+        # Puntos clave = primeras 6 frases
         keypoints = sentences[:6]
-        lis = [f"<li style='margin:6px 0'>{self._highlight_entities(s)}</li>" for s in keypoints]
+        lis = []
+        for s in keypoints:
+            item = self._highlight_entities(s)
+            item = self._highlight_priority_country(item)
+            lis.append(f"<li style='margin:6px 0'>{item}</li>")
         html_keypoints = "\n".join(lis) if lis else "<li>Sin datos destacados.</li>"
 
+        # Agrupar por enfermedad
         buckets: Dict[str, List[str]] = {k: [] for k in self.DISEASE_PATTERNS.keys()}
         others: List[str] = []
         for s in sentences:
             placed = False
             for name, pat in self.DISEASE_PATTERNS.items():
                 if pat.search(s):
-                    buckets[name].append(self._highlight_entities(s))
+                    item = self._highlight_entities(s)
+                    item = self._highlight_priority_country(item)
+                    buckets[name].append(item)
                     placed = True
             if not placed:
-                others.append(self._highlight_entities(s))
+                item = self._highlight_entities(s)
+                item = self._highlight_priority_country(item)
+                others.append(item)
 
         sections = []
         for name, items in buckets.items():
             if not items:
                 continue
+            icon = self.ICONS.get(name, "•")
             items_html = "".join(f"<li style='margin:4px 0'>{it}</li>" for it in items[:6])
-            sections.append(
-                f"""
-                <tr>
-                  <td style="padding:12px 14px;border-bottom:1px solid #eee">
-                    <div style="font-weight:700;color:#333;margin-bottom:6px">{name}</div>
-                    <ul style="padding-left:18px;margin:0">{items_html}</ul>
-                  </td>
-                </tr>
-                """.strip()
+            block = (
+                "<tr>"
+                "<td style='padding:12px 14px;border-bottom:1px solid #eee'>"
+                f"<div style='font-weight:700;color:#333;margin-bottom:6px'>{icon} {name}</div>"
+                f"<ul style='padding-left:18px;margin:0'>{items_html}</ul>"
+                "</td>"
+                "</tr>"
             )
+            sections.append(block)
         if others:
             items_html = "".join(f"<li style='margin:4px 0'>{it}</li>" for it in others[:6])
-            sections.append(
-                f"""
-                <tr>
-                  <td style="padding:12px 14px;border-bottom:1px solid #eee">
-                    <div style="font-weight:700;color:#333;margin-bottom:6px">Otros</div>
-                    <ul style="padding-left:18px;margin:0">{items_html}</ul>
-                  </td>
-                </tr>
-                """.strip()
+            block = (
+                "<tr>"
+                "<td style='padding:12px 14px;border-bottom:1px solid #eee'>"
+                "<div style='font-weight:700;color:#333;margin-bottom:6px'>Otros</div>"
+                f"<ul style='padding-left:18px;margin:0'>{items_html}</ul>"
+                "</td>"
+                "</tr>"
             )
+            sections.append(block)
+
         html_by_disease = "\n".join(sections) if sections else ""
         return f"<ul style='padding-left:18px;margin:0'>{html_keypoints}</ul>", html_by_disease
 
@@ -516,64 +597,58 @@ class WeeklyReportAgent:
         keypoints_html, by_disease_html = self.format_summary_to_html(summary_es)
         title_week = f"Semana {week} · {year}" if week and year else "Último informe ECDC"
 
-        # Construir bloque condicional aparte (evita f-strings anidadas)
+        # Bloque condicional para el detalle por enfermedad
         detail_block = ""
         if by_disease_html:
             divider = "<tr><td style='padding:0 20px 6px'><div style='height:1px;background:#eee'></div></td></tr>"
             detail_block = (
                 f"{divider}"
-                f"<tr>"
-                f"<td style='padding:6px 20px 14px'>"
-                f"<div style='font-weight:700;color:#333;margin-bottom:8px'>Detalle por enfermedad</div>"
-                f"<table role='presentation' width='100%' cellspacing='0' cellpadding='0' "
-                f"style='border:1px solid #f0f0f0;border-radius:8px;overflow:hidden'>"
+                "<tr>"
+                "<td style='padding:6px 20px 14px'>"
+                "<div style='font-weight:700;color:#333;margin-bottom:8px'>Detalle por enfermedad</div>"
+                "<table role='presentation' width='100%' cellspacing='0' cellpadding='0' "
+                "style='border:1px solid #f0f0f0;border-radius:8px;overflow:hidden'>"
                 f"{by_disease_html}"
-                f"</table>"
-                f"</td>"
-                f"</tr>"
+                "</table>"
+                "</td>"
+                "</tr>"
             )
 
-        return f"""
-        <html>
-          <body style="margin:0;padding:0;background:#f5f7fb">
-            <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#f5f7fb;padding:18px 12px">
-              <tr>
-                <td align="center">
-                  <table role="presentation" width="680" cellspacing="0" cellpadding="0" style="max-width:680px;background:#ffffff;border-radius:10px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,.06)">
-                    <tr>
-                      <td style="background:#0b5cab;color:#fff;padding:18px 20px">
-                        <div style="font-size:20px;font-weight:700">Boletín semanal de amenazas sanitarias</div>
-                        <div style="opacity:.9;font-size:14px;margin-top:4px">{title_week}</div>
-                      </td>
-                    </tr>
-
-                    <tr>
-                      <td style="padding:18px 20px">
-                        <div style="font-weight:700;color:#333;margin-bottom:8px">Puntos clave</div>
-                        {keypoints_html}
-                      </td>
-                    </tr>
-
-                    {detail_block}
-
-                    <tr>
-                      <td align="center" style="padding:8px 20px 22px">
-                        <a href="{pdf_url}" style="display:inline-block;background:#0b5cab;color:#fff;text-decoration:none;padding:10px 16px;border-radius:8px;font-weight:700">Abrir informe completo (PDF)</a>
-                      </td>
-                    </tr>
-
-                    <tr>
-                      <td style="background:#f3f4f6;color:#6b7280;padding:12px 20px;font-size:12px;text-align:center">
-                        Generado automáticamente · {dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")}
-                      </td>
-                    </tr>
-                  </table>
-                </td>
-              </tr>
-            </table>
-          </body>
-        </html>
-        """.strip()
+        return (
+            "<html>"
+            "<body style='margin:0;padding:0;background:#f5f7fb'>"
+            "<table role='presentation' width='100%' cellspacing='0' cellpadding='0' style='background:#f5f7fb;padding:18px 12px'>"
+            "<tr><td align='center'>"
+            "<table role='presentation' width='680' cellspacing='0' cellpadding='0' style='max-width:680px;background:#ffffff;border-radius:10px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,.06)'>"
+            "<tr>"
+            "<td style='background:#0b5cab;color:#fff;padding:18px 20px'>"
+            "<div style='font-size:20px;font-weight:700'>Boletín semanal de amenazas sanitarias</div>"
+            f"<div style='opacity:.9;font-size:14px;margin-top:4px'>{title_week}</div>"
+            "</td>"
+            "</tr>"
+            "<tr>"
+            "<td style='padding:18px 20px'>"
+            "<div style='font-weight:700;color:#333;margin-bottom:8px'>Puntos clave</div>"
+            f"{keypoints_html}"
+            "</td>"
+            "</tr>"
+            f"{detail_block}"
+            "<tr>"
+            "<td align='center' style='padding:8px 20px 22px'>"
+            f"<a href='{pdf_url}' style='display:inline-block;background:#0b5cab;color:#fff;text-decoration:none;padding:10px 16px;border-radius:8px;font-weight:700'>Abrir informe completo (PDF)</a>"
+            "</td>"
+            "</tr>"
+            "<tr>"
+            "<td style='background:#f3f4f6;color:#6b7280;padding:12px 20px;font-size:12px;text-align:center'>"
+            f"Generado automáticamente · {dt.datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}"
+            "</td>"
+            "</tr>"
+            "</table>"
+            "</td></tr>"
+            "</table>"
+            "</body>"
+            "</html>"
+        )
 
     # ------------------------- Envío -----------------------------------
 
@@ -601,7 +676,7 @@ class WeeklyReportAgent:
                         server.login(self.config.sender_email, self.config.email_password)
                     server.send_message(msg)
             else:
-                logging.debug("SMTP: STARTTLS (%s) a %s ...", self.config.smtp_server, self.config.smtp_port)
+                logging.debug("SMTP: STARTTLS (%s) a %s ...", self.config.smtp_port, self.config.smtp_server)
                 with smtplib.SMTP(self.config.smtp_server, self.config.smtp_port, timeout=30) as server:
                     server.ehlo()
                     server.starttls(context=context)
@@ -678,7 +753,7 @@ class WeeklyReportAgent:
 
         # HTML visual + asunto + plain text
         html = self.build_html(summary_es, pdf_url, week, year)
-        subject = f"ECDC CDTR – Week {week} ({year})" if week and year else "Resumen del informe semanal del ECDC"
+        subject = f"ECDC CDTR – Semana {week} ({year})" if week and year else "Resumen del informe semanal del ECDC"
 
         plain_sentences = self._split_sentences(summary_es)[:8]
         plain = "Boletín semanal de amenazas sanitarias\n" + \
