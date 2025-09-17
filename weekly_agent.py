@@ -445,16 +445,13 @@ class WeeklyReportAgent:
 
     @staticmethod
     def _split_sentences(text: str) -> List[str]:
-        # Segmentar en frases para poblar viñetas/secciones
         parts = re.split(r'(?<=[.!?])\s+', text.strip())
         return [p.strip() for p in parts if p.strip()]
 
     def _highlight_entities(self, s: str) -> str:
-        # Negritas en nombres de enfermedades y países (heurístico simple para países comunes EU/OMS)
         s_html = s
-        for name, pat in self.DISEASE_PATTERNS.items():
+        for _, pat in self.DISEASE_PATTERNS.items():
             s_html = pat.sub(lambda m: f"<strong style='color:#8b0000'>{m.group(0)}</strong>", s_html)
-
         country_list = [
             "spain","france","italy","germany","portugal","greece","poland","romania","netherlands","belgium",
             "sweden","norway","finland","denmark","ireland","uk","united kingdom","austria","czech","hungary",
@@ -467,20 +464,11 @@ class WeeklyReportAgent:
         return s_html
 
     def format_summary_to_html(self, summary_es: str) -> Tuple[str, str]:
-        """
-        Devuelve (html_keypoints, html_by_disease)
-        - html_keypoints: lista <li> con primeras N frases
-        - html_by_disease: bloques por enfermedad con las frases que la mencionan
-        """
         sentences = self._split_sentences(summary_es)
-        # Key points = primeras 6 frases (o todas si menos)
         keypoints = sentences[:6]
-        lis = []
-        for s in keypoints:
-            lis.append(f"<li style='margin:6px 0'>{self._highlight_entities(s)}</li>")
+        lis = [f"<li style='margin:6px 0'>{self._highlight_entities(s)}</li>" for s in keypoints]
         html_keypoints = "\n".join(lis) if lis else "<li>Sin datos destacados.</li>"
 
-        # Agrupar por enfermedad
         buckets: Dict[str, List[str]] = {k: [] for k in self.DISEASE_PATTERNS.keys()}
         others: List[str] = []
         for s in sentences:
@@ -527,7 +515,24 @@ class WeeklyReportAgent:
     def build_html(self, summary_es: str, pdf_url: str, week: Optional[int], year: Optional[int]) -> str:
         keypoints_html, by_disease_html = self.format_summary_to_html(summary_es)
         title_week = f"Semana {week} · {year}" if week and year else "Último informe ECDC"
-        # Layout basado en tablas con estilos inline -> compatibilidad Gmail/Outlook
+
+        # Construir bloque condicional aparte (evita f-strings anidadas)
+        detail_block = ""
+        if by_disease_html:
+            divider = "<tr><td style='padding:0 20px 6px'><div style='height:1px;background:#eee'></div></td></tr>"
+            detail_block = (
+                f"{divider}"
+                f"<tr>"
+                f"<td style='padding:6px 20px 14px'>"
+                f"<div style='font-weight:700;color:#333;margin-bottom:8px'>Detalle por enfermedad</div>"
+                f"<table role='presentation' width='100%' cellspacing='0' cellpadding='0' "
+                f"style='border:1px solid #f0f0f0;border-radius:8px;overflow:hidden'>"
+                f"{by_disease_html}"
+                f"</table>"
+                f"</td>"
+                f"</tr>"
+            )
+
         return f"""
         <html>
           <body style="margin:0;padding:0;background:#f5f7fb">
@@ -549,18 +554,7 @@ class WeeklyReportAgent:
                       </td>
                     </tr>
 
-                    {"<tr><td style='padding:0 20px 6px'><div style='height:1px;background:#eee'></div></td></tr>" if by_disease_html else ""}
-
-                    {f"""
-                    <tr>
-                      <td style="padding:6px 20px 14px">
-                        <div style="font-weight:700;color:#333;margin-bottom:8px">Detalle por enfermedad</div>
-                        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border:1px solid #f0f0f0;border-radius:8px;overflow:hidden">
-                          {by_disease_html}
-                        </table>
-                      </td>
-                    </tr>
-                    """ if by_disease_html else ""}
+                    {detail_block}
 
                     <tr>
                       <td align="center" style="padding:8px 20px 22px">
@@ -682,11 +676,10 @@ class WeeklyReportAgent:
             logging.exception("Fallo traduciendo, envío el original en inglés: %s", e)
             summary_es = summary_en
 
-        # Construir HTML visual + asunto
+        # HTML visual + asunto + plain text
         html = self.build_html(summary_es, pdf_url, week, year)
         subject = f"ECDC CDTR – Week {week} ({year})" if week and year else "Resumen del informe semanal del ECDC"
 
-        # Plain text (para clientes que no muestren HTML): usa puntos clave
         plain_sentences = self._split_sentences(summary_es)[:8]
         plain = "Boletín semanal de amenazas sanitarias\n" + \
                 (f"Semana {week} · {year}\n\n" if week and year else "\n") + \
