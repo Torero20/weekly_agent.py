@@ -23,9 +23,12 @@ from bs4 import BeautifulSoup
 # PDF
 import pdfplumber  # type: ignore
 try:
-    from pdfminer.high_level import extract_text as pm_extract  # type: ignore
+    from pdfminer_high_level import extract_text as pm_extract  # some envs rename
 except Exception:
-    pm_extract = None  # type: ignore
+    try:
+        from pdfminer.high_level import extract_text as pm_extract  # type: ignore
+    except Exception:
+        pm_extract = None  # type: ignore
 
 # Sumario
 from sumy.parsers.plaintext import PlaintextParser
@@ -44,19 +47,13 @@ except Exception:
 # ---------------------------------------------------------------------
 
 def _ensure_nltk_resources() -> bool:
-    """
-    Garantiza que los recursos de NLTK necesarios estén disponibles.
-    Devuelve True si podemos usar sumy+NLTK; False si no (y entonces usaremos fallback).
-    """
+    """Garantiza recursos NLTK (punkt/punkt_tab) si están disponibles; si falla, devolvemos False."""
     try:
         import nltk
-        # Puedes añadir un path local de cache si quieres:
-        # nltk.data.path.append(os.path.join(os.getcwd(), "nltk_data"))
         try:
             nltk.data.find("tokenizers/punkt")
         except LookupError:
             nltk.download("punkt", quiet=True)
-        # En NLTK recientes existe 'punkt_tab'; si no, lo ignoramos.
         try:
             nltk.data.find("tokenizers/punkt_tab/english.pickle")
         except LookupError:
@@ -70,37 +67,22 @@ def _ensure_nltk_resources() -> bool:
 
 
 def _simple_extractive_summary(text: str, n_sentences: int) -> str:
-    """
-    Fallback sin NLTK: divide por signos de puntuación y puntúa por frecuencia de palabras.
-    No es tan bueno como LexRank, pero evita que el flujo se caiga y entrega un resumen útil.
-    """
+    """Fallback sin NLTK: segmenta por puntuación y puntúa por frecuencia de palabras."""
     import re
     from collections import Counter
-
     n_sentences = max(1, n_sentences)
     text = (text or "").strip()
     if not text:
         return ""
-
-    # División grosera de oraciones
     sentences = re.split(r'(?<=[.!?])\s+', text)
-    sentences = [s.strip() for s in sentences if s and len(s.strip()) > 0]
-    if not sentences:
-        return ""
-
-    # Limita para evitar coste excesivo en PDFs muy largos
-    sentences = sentences[:250]
-
+    sentences = [s.strip() for s in sentences if s.strip()]
+    sentences = sentences[:250] or sentences
     words = re.findall(r"[A-Za-zÀ-ÿ']{3,}", text.lower())
     if not words:
         return " ".join(sentences[:n_sentences])
-
     freqs = Counter(words)
-
     def score(s: str) -> int:
-        ws = re.findall(r"[A-Za-zÀ-ÿ']{3,}", s.lower())
-        return sum(freqs.get(w, 0) for w in ws)
-
+        return sum(freqs.get(w, 0) for w in re.findall(r"[A-Za-zÀ-ÿ']{3,}", s.lower()))
     ranked = sorted(sentences, key=score, reverse=True)
     return " ".join(ranked[:n_sentences])
 
@@ -125,23 +107,18 @@ class Config:
         r"/communicable-disease-threats-report-week-(\d{1,2})-(\d{4})\.pdf$"
     )
 
-    # Nº de oraciones del sumario (puede sobreescribirse con env SUMMARY_SENTENCES)
+    # Nº de oraciones del sumario
     summary_sentences: int = int(os.getenv("SUMMARY_SENTENCES", "12") or "12")
 
-    # SMTP/Email (rellenado vía variables de entorno/secretos)
+    # SMTP/Email
     smtp_server: str = os.getenv("SMTP_SERVER", "")
     smtp_port: int = int(os.getenv("SMTP_PORT", "465") or "465")
     sender_email: str = os.getenv("SENDER_EMAIL", "")
     receiver_email: str = os.getenv("RECEIVER_EMAIL", "")
     email_password: str = os.getenv("EMAIL_PASSWORD", "")
 
-    # Bandera para no enviar correo (tests): DRY_RUN=1
     dry_run: bool = os.getenv("DRY_RUN", "0") == "1"
-
-    # Log level
     log_level: str = os.getenv("LOG_LEVEL", "INFO")
-
-    # Tamaño máximo (MB) para abortar PDFs inusualmente grandes
     max_pdf_mb: int = 25
 
 
@@ -151,22 +128,18 @@ class Config:
 
 class WeeklyReportAgent:
     """
-    Pipeline:
-      1) Intenta localizar el PDF de la semana actual (Plan A: URL directa, con y sin cero).
-      2) Si falla, rastrea la página de listados y localiza el PDF más reciente (Plan B).
-      3) Descarga, extrae texto, resume (LexRank con fallback), traduce al español (opcional) y envía email.
+    1) Busca PDF por URL directa (con y sin cero).
+    2) Si falla o no es el último, rastrea el listado, entra en artículos y saca el PDF.
+    3) Descarga, extrae, resume (LexRank con fallback), traduce (opcional) y envía email.
     """
 
     def __init__(self, config: Config) -> None:
         self.config = config
-
         logging.basicConfig(
             level=getattr(logging, self.config.log_level.upper(), logging.INFO),
             format="%(asctime)s %(levelname)s %(message)s",
             datefmt="%Y-%m-%d %H:%M:%S"
         )
-
-        # Sesión HTTP con reintentos
         self.session = requests.Session()
         self.session.headers.update({
             "User-Agent": (
@@ -186,8 +159,6 @@ class WeeklyReportAgent:
         )
         self.session.mount("https://", adapter)
         self.session.mount("http://", adapter)
-
-        # Traductor opcional
         self.translator = Translator() if Translator is not None else None
 
     # ------------------------ Localización del PDF ---------------------
@@ -196,7 +167,6 @@ class WeeklyReportAgent:
         """Plan A: URL directa del PDF por semana ISO; retrocede hasta 6 semanas; prueba con y sin cero."""
         today = dt.date.today()
         year, week, _ = today.isocalendar()
-
         for delta in range(0, 7):
             w = week - delta
             y = year
@@ -204,7 +174,6 @@ class WeeklyReportAgent:
                 y = year - 1
                 last_week_prev_year = dt.date(y, 12, 28).isocalendar()[1]
                 w = last_week_prev_year + w
-
             for wk in (str(w), str(w).zfill(2)):
                 url = self.config.direct_pdf_template.format(week=wk, year=y)
                 try:
@@ -218,7 +187,53 @@ class WeeklyReportAgent:
         return None
 
     def _scan_listing_page(self) -> Optional[str]:
-        """Plan B: rastrea la página de listados y devuelve el PDF más reciente que exista."""
+        """
+        Plan B robusto:
+        - Identifica PDFs directos y también páginas de artículo (publications-data / publications-and-data).
+        - Entra en artículos, localiza el enlace PDF interno.
+        - Extrae (week, year) del título/URL/PDF; si falta, usa fecha de publicación para desempatar.
+        """
+        def parse_week_year_from_text(s: str) -> Tuple[Optional[int], Optional[int]]:
+            s = (s or "").lower()
+            mw = re.search(r"week[\s\-]?(\d{1,2})", s)
+            wy = int(mw.group(1)) if mw else None
+            my = re.search(r"(20\d{2})", s)
+            yy = int(my.group(1)) if my else None
+            return wy, yy
+
+        def fetch_pdf_from_article(url: str) -> Tuple[Optional[str], Optional[int], Optional[int], Optional[str]]:
+            try:
+                r = self.session.get(url, timeout=20)
+                r.raise_for_status()
+            except requests.RequestException:
+                return None, None, None, None
+            soup = BeautifulSoup(r.text, "html.parser")
+            # Fecha publicación (opcional)
+            published_iso = None
+            meta_pub = soup.find("meta", {"property": "article:published_time"}) or soup.find("time", {"itemprop": "datePublished"})
+            if meta_pub and meta_pub.get("content"):
+                published_iso = meta_pub["content"]
+            elif meta_pub and meta_pub.get("datetime"):
+                published_iso = meta_pub["datetime"]
+            # Primer PDF interno
+            pdf_url = None
+            for a in soup.find_all("a", href=True):
+                href = a["href"]
+                if href.lower().endswith(".pdf"):
+                    if not href.startswith("http"):
+                        href = requests.compat.urljoin(url, href)
+                    pdf_url = href
+                    break
+            # (week, year) desde título/URL y refuerzo con nombre del PDF
+            full_text = " ".join([
+                soup.title.get_text(strip=True) if soup.title else "",
+                url,
+                pdf_url or ""
+            ])
+            w, y = parse_week_year_from_text(full_text)
+            return pdf_url, w, y, published_iso
+
+        # Descargar listado
         try:
             r = self.session.get(self.config.base_url, timeout=20)
             r.raise_for_status()
@@ -227,7 +242,9 @@ class WeeklyReportAgent:
             return None
 
         soup = BeautifulSoup(r.text, "html.parser")
-        candidates: List[Tuple[int, int, str]] = []
+        candidates: List[Tuple[int, int, str, Optional[str]]] = []  # (year, week, pdf_url, published_iso)
+        article_links: List[str] = []
+        direct_pdfs: List[str] = []
 
         for a in soup.find_all("a", href=True):
             href = a["href"]
@@ -235,95 +252,125 @@ class WeeklyReportAgent:
                 continue
             if not href.startswith("http"):
                 href = requests.compat.urljoin(self.config.base_url, href)
+            lch = href.lower()
+            if lch.endswith(".pdf") and "communicable-disease-threats-report" in lch:
+                direct_pdfs.append(href)
+            elif "communicable-disease-threats-report" in lch and ("/publications-data/" in lch or "/publications-and-data/" in lch):
+                article_links.append(href)
 
-            m = self.config.pdf_regex.search(href)
-            if not m:
+        # Procesar solo los 15 más recientes para evitar exceso de peticiones
+        article_links = article_links[:15]
+
+        # a) artículos
+        for art in article_links:
+            pdf_url, w, y, published_iso = fetch_pdf_from_article(art)
+            if not pdf_url:
                 continue
-
-            week = int(m.group(1))
-            year = int(m.group(2))
-
-            # Algunos servidores no permiten HEAD; si falla, aún así conservamos el candidato
-            ok = False
+            # Verificar (opcional) que responde como PDF
+            ok = True
             try:
-                h = self.session.head(href, timeout=12, allow_redirects=True)
+                h = self.session.head(pdf_url, timeout=12, allow_redirects=True)
                 ct = h.headers.get("Content-Type", "").lower()
-                if h.status_code == 200 and "pdf" in ct:
-                    ok = True
+                if h.status_code != 200 or "pdf" not in ct:
+                    ok = False
             except requests.RequestException:
-                # Mantener candidato: ya lo verificaremos al descargar
-                ok = True
-
+                ok = True  # muchos sitios bloquean HEAD; probaremos al descargar
             if ok:
-                candidates.append((year, week, href))
-                logging.debug("Candidato listado: %s (w=%s, y=%s)", href, week, year)
+                if y is None:
+                    _, y = parse_week_year_from_text(art)
+                if y is None:
+                    y = dt.date.today().year
+                w = w or 0
+                candidates.append((y, w, pdf_url, published_iso))
+
+        # b) PDFs directos del listado
+        for href in direct_pdfs:
+            w, y = parse_week_year_from_text(href)
+            if y is None:
+                y = dt.date.today().year
+            w = w or 0
+            candidates.append((y, w, href, None))
 
         if not candidates:
             return None
 
-        # El más reciente por (año, semana) desc
-        candidates.sort(reverse=True)
-        _, _, best = candidates[0]
-        return best
+        # Orden principal: (year desc, week desc)
+        candidates.sort(key=lambda t: (t[0], t[1]), reverse=True)
+
+        # Si el top no tiene week (>0), desempatar por published_iso más reciente
+        top_year, top_week, _, _ = candidates[0]
+        if top_week == 0:
+            def published_key(iso: Optional[str]) -> float:
+                try:
+                    from datetime import datetime
+                    return datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp() if iso else 0.0
+                except Exception:
+                    return 0.0
+            candidates.sort(key=lambda t: published_key(t[3]), reverse=True)
+
+        return candidates[0][2]
 
     def fetch_latest_pdf_url(self) -> Optional[str]:
-        """Intenta Plan A; si falla, Plan B."""
-        url = self._try_direct_weekly_pdf()
-        if url:
-            logging.info("PDF directo encontrado: %s", url)
-            return url
+        """Elige el mejor entre Plan A (rápido) y Plan B (artículos)."""
+        url_a = self._try_direct_weekly_pdf()
+        url_b = self._scan_listing_page()
 
-        url = self._scan_listing_page()
-        if url:
-            logging.info("PDF por listado encontrado: %s", url)
-        else:
-            logging.info("No se encontró PDF nuevo.")
-        return url
+        def week_year(href: Optional[str]) -> Tuple[int, int]:
+            if not href:
+                return (0, 0)
+            m = re.search(r"week[\s\-]?(\d{1,2}).*?(20\d{2})", (href or "").lower())
+            if m:
+                return (int(m.group(1)), int(m.group(2)))
+            # búsqueda relajada por si viene separado
+            mw = re.search(r"week[\s\-]?(\d{1,2})", (href or "").lower())
+            my = re.search(r"(20\d{2})", (href or "").lower())
+            return (int(mw.group(1)) if mw else 0, int(my.group(1)) if my else 0)
+
+        wa, ya = week_year(url_a)
+        wb, yb = week_year(url_b)
+
+        if url_a and (wa, ya) >= (wb, yb):
+            logging.info("PDF directo seleccionado: %s", url_a)
+            return url_a
+        if url_b:
+            logging.info("PDF extraído de artículo seleccionado: %s", url_b)
+            return url_b
+        return url_a or url_b
 
     # --------------------- Descarga / extracción -----------------------
 
     def download_pdf(self, pdf_url: str, dest_path: str, max_mb: int = 25) -> None:
-        """Descarga el PDF (si servidor devuelve HTML, reintenta con ?download=1)."""
-
+        """Descarga el PDF; si servidor devuelve HTML, reintenta con ?download=1."""
         def _append_download_param(url: str) -> str:
             return url + ("&download=1" if "?" in url else "?download=1")
-
         def _looks_like_pdf(first_bytes: bytes) -> bool:
             return first_bytes.startswith(b"%PDF")
 
-        # 1) HEAD opcional para tamaño
+        # HEAD opcional para tamaño
         try:
             h = self.session.head(pdf_url, timeout=15, allow_redirects=True)
             clen = h.headers.get("Content-Length")
             if clen and int(clen) > max_mb * 1024 * 1024:
-                raise RuntimeError(
-                    f"El PDF excede {max_mb} MB ({int(clen)/1024/1024:.1f} MB)"
-                )
+                raise RuntimeError(f"El PDF excede {max_mb} MB ({int(clen)/1024/1024:.1f} MB)")
         except requests.RequestException:
             pass
 
-        headers = {
-            "Accept": "application/pdf",
-            "Referer": self.config.base_url,
-            "Cache-Control": "no-cache",
-        }
+        headers = {"Accept": "application/pdf", "Referer": self.config.base_url, "Cache-Control": "no-cache"}
 
         def _try_get(url: str) -> Tuple[str, Optional[str], bytes]:
             r = self.session.get(url, headers=headers, stream=True, timeout=45, allow_redirects=True)
             r.raise_for_status()
             ct = r.headers.get("Content-Type", "")
-            chunk_iter = r.iter_content(chunk_size=8192)
-            first = next(chunk_iter, b"")
+            it = r.iter_content(chunk_size=8192)
+            first = next(it, b"")
             with open(dest_path, "wb") as f:
                 if first:
                     f.write(first)
-                for chunk in chunk_iter:
-                    if not chunk:
-                        continue
-                    f.write(chunk)
+                for chunk in it:
+                    if chunk:
+                        f.write(chunk)
             return ct, r.headers.get("Content-Length"), first
 
-        # 2) Primer intento
         try:
             ct, clen, first = _try_get(pdf_url)
             logging.debug("GET %s -> Content-Type=%s, len=%s", pdf_url, ct, clen)
@@ -331,74 +378,63 @@ class WeeklyReportAgent:
                 return
             logging.info("Respuesta no-PDF. Reintentando con ?download=1 ...")
         except requests.RequestException as e:
-            logging.info("Fallo en GET inicial (%s). Reintentamos con ?download=1 ...", e)
+            logging.info("GET inicial falló (%s). Reintentamos con ?download=1 ...", e)
 
-        # 3) Segundo intento con ?download=1
         retry_url = _append_download_param(pdf_url)
         ct2, clen2, first2 = _try_get(retry_url)
         logging.debug("GET %s -> Content-Type=%s, len=%s", retry_url, ct2, clen2)
         if ("pdf" in (ct2 or "").lower()) and _looks_like_pdf(first2):
             return
 
-        # 4) Error final
-        raise RuntimeError(
-            f"No se obtuvo un PDF válido (Content-Type={ct2!r}, firma={first2[:8]!r})."
-        )
+        raise RuntimeError(f"No se obtuvo un PDF válido (Content-Type={ct2!r}, firma={first2[:8]!r}).")
 
     def extract_text(self, pdf_path: str) -> str:
         """Extrae texto con pdfplumber y, si falla, con pdfminer (si está disponible)."""
         try:
-            full_text = []
+            parts = []
             with pdfplumber.open(pdf_path) as pdf:
                 for page in pdf.pages:
-                    full_text.append(page.extract_text() or "")
-            return "\n".join(full_text)
+                    parts.append(page.extract_text() or "")
+            return "\n".join(parts)
         except Exception as e:
-            logging.warning("Fallo pdfplumber: %s. Usando pdfminer...", e)
+            logging.warning("Fallo pdfplumber: %s. Probando pdfminer...", e)
             if pm_extract:
                 try:
                     return pm_extract(pdf_path)
                 except Exception as pm_e:
                     logging.error("Fallo pdfminer: %s", pm_e)
                     return ""
-            else:
-                logging.error("pdfminer no instalado.")
-                return ""
+            logging.error("pdfminer no disponible.")
+            return ""
 
     # -------------------------- Sumario --------------------------------
 
     def summarize(self, text: str, sentences: int) -> str:
-        if not text or not text.strip():
+        if not text.strip():
             return ""
-
-        # Intento con LexRank + NLTK (descargando recursos si faltan)
         if _ensure_nltk_resources():
             try:
                 parser = PlaintextParser.from_string(text, Tokenizer("english"))
                 summarizer = LexRankSummarizer()
                 sents = summarizer(parser.document, max(1, sentences))
-                result = " ".join(str(s) for s in sents)
-                if result.strip():
-                    return result
+                out = " ".join(str(s) for s in sents)
+                if out.strip():
+                    return out
             except Exception as e:
-                logging.warning("LexRank falló, uso fallback sin NLTK: %s", e)
+                logging.warning("LexRank falló; uso fallback: %s", e)
         else:
-            logging.info("NLTK no disponible; uso fallback de resumen.")
-
-        # Fallback sencillo sin NLTK
+            logging.info("NLTK no disponible; uso fallback.")
         return _simple_extractive_summary(text, sentences)
 
     # ------------------------- Traducción -------------------------------
 
     def translate_to_spanish(self, text: str) -> str:
-        if not text.strip():
-            return text
-        if self.translator is None:
+        if not text.strip() or self.translator is None:
             return text
         try:
             return self.translator.translate(text, dest="es").text
         except Exception as e:
-            logging.warning("Fallo traduciendo con googletrans: %s. Envío en inglés.", e)
+            logging.warning("Fallo googletrans (%s). Envío en inglés.", e)
             return text
 
     # ------------------------- Email -----------------------------------
@@ -448,17 +484,16 @@ class WeeklyReportAgent:
             msg.add_alternative(html, subtype="html")
 
         context = ssl.create_default_context()
-
         try:
             if self.config.smtp_port == 465:
-                logging.debug("SMTP: conexión SSL (465) a %s ...", self.config.smtp_server)
+                logging.debug("SMTP: SSL (465) a %s ...", self.config.smtp_server)
                 with smtplib.SMTP_SSL(self.config.smtp_server, self.config.smtp_port, context=context) as server:
                     server.ehlo()
                     if self.config.email_password:
                         server.login(self.config.sender_email, self.config.email_password)
                     server.send_message(msg)
             else:
-                logging.debug("SMTP: conexión STARTTLS (%s) a %s ...", self.config.smtp_port, self.config.smtp_server)
+                logging.debug("SMTP: STARTTLS (%s) a %s ...", self.config.smtp_port, self.config.smtp_server)
                 with smtplib.SMTP(self.config.smtp_server, self.config.smtp_port, timeout=30) as server:
                     server.ehlo()
                     server.starttls(context=context)
@@ -466,26 +501,9 @@ class WeeklyReportAgent:
                     if self.config.email_password:
                         server.login(self.config.sender_email, self.config.email_password)
                     server.send_message(msg)
-
             logging.info("Correo enviado correctamente.")
-        except smtplib.SMTPAuthenticationError as e:
-            logging.error("Fallo de autenticación SMTP: %s", e)
-            logging.error("Posible necesidad de App Password / MFA / credenciales incorrectas.")
-            raise
-        except smtplib.SMTPSenderRefused as e:
-            logging.error("Remitente rechazado (From no autorizado): %s", e)
-            raise
-        except smtplib.SMTPRecipientsRefused as e:
-            logging.error("Receptor rechazado por el servidor: %s", e)
-            raise
-        except smtplib.SMTPConnectError as e:
-            logging.error("No se pudo conectar al servidor SMTP: %s", e)
-            raise
-        except smtplib.SMTPException as e:
-            logging.error("Error SMTP genérico: %s", e)
-            raise
         except Exception as e:
-            logging.exception("Error inesperado enviando email: %s", e)
+            logging.exception("Error enviando email: %s", e)
             raise
 
     # --------------------------- Run -----------------------------------
@@ -502,14 +520,12 @@ class WeeklyReportAgent:
             with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
                 tmp_path = tmp.name
 
-            # Descargar
             try:
                 self.download_pdf(pdf_url, tmp_path, max_mb=self.config.max_pdf_mb)
             except Exception as e:
                 logging.exception("Fallo descargando el PDF: %s", e)
                 return
 
-            # Extraer
             try:
                 text = self.extract_text(tmp_path) or ""
             except Exception as e:
@@ -528,7 +544,6 @@ class WeeklyReportAgent:
             logging.warning("El PDF no contiene texto extraíble.")
             return
 
-        # Resumen
         try:
             summary_en = self.summarize(text, self.config.summary_sentences)
         except Exception as e:
@@ -538,7 +553,6 @@ class WeeklyReportAgent:
             logging.warning("No se pudo generar resumen.")
             return
 
-        # Traducción (opcional)
         try:
             summary_es = self.translate_to_spanish(summary_en)
         except Exception as e:
@@ -553,7 +567,6 @@ class WeeklyReportAgent:
             logging.debug("Resumen ES:\n%s", summary_es)
             return
 
-        # Envío
         try:
             self.send_email(subject, summary_es, html)
         except Exception as e:
@@ -569,7 +582,5 @@ def main() -> None:
     agent = WeeklyReportAgent(cfg)
     agent.run()
 
-
 if __name__ == "__main__":
     main()
-
