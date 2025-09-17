@@ -8,6 +8,7 @@ import re
 import ssl
 import smtplib
 import time
+import json
 import logging
 logging.getLogger("pdfminer").setLevel(logging.ERROR)
 logging.getLogger("pdfminer.pdfinterp").setLevel(logging.ERROR)
@@ -15,7 +16,8 @@ import tempfile
 import datetime as dt
 from dataclasses import dataclass
 from email.message import EmailMessage
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict, Any
+from urllib.parse import unquote
 
 import requests
 from bs4 import BeautifulSoup
@@ -23,7 +25,7 @@ from bs4 import BeautifulSoup
 # PDF
 import pdfplumber  # type: ignore
 try:
-    from pdfminer_high_level import extract_text as pm_extract  # some envs rename
+    from pdfminer_high_level import extract_text as pm_extract  # type: ignore
 except Exception:
     try:
         from pdfminer.high_level import extract_text as pm_extract  # type: ignore
@@ -117,6 +119,10 @@ class Config:
     receiver_email: str = os.getenv("RECEIVER_EMAIL", "")
     email_password: str = os.getenv("EMAIL_PASSWORD", "")
 
+    # Estado (para evitar reenvíos)
+    state_path: str = os.getenv("STATE_PATH", "./.weekly_agent_state.json")
+    force_send: bool = os.getenv("FORCE_SEND", "0") == "1"
+
     dry_run: bool = os.getenv("DRY_RUN", "0") == "1"
     log_level: str = os.getenv("LOG_LEVEL", "INFO")
     max_pdf_mb: int = 25
@@ -131,6 +137,8 @@ class WeeklyReportAgent:
     1) Busca PDF por URL directa (con y sin cero).
     2) Si falla o no es el último, rastrea el listado, entra en artículos y saca el PDF.
     3) Descarga, extrae, resume (LexRank con fallback), traduce (opcional) y envía email.
+    4) Evita duplicados guardando el último PDF enviado en 'state_path'.
+    5) Asunto del correo incluye Week/Year si están disponibles.
     """
 
     def __init__(self, config: Config) -> None:
@@ -161,9 +169,44 @@ class WeeklyReportAgent:
         self.session.mount("http://", adapter)
         self.translator = Translator() if Translator is not None else None
 
+    # ------------------------ Estado -----------------------------------
+
+    def _load_state(self) -> Dict[str, Any]:
+        try:
+            if os.path.exists(self.config.state_path):
+                with open(self.config.state_path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+        except Exception as e:
+            logging.warning("No se pudo leer state_path (%s): %s", self.config.state_path, e)
+        return {}
+
+    def _save_state(self, data: Dict[str, Any]) -> None:
+        try:
+            with open(self.config.state_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logging.warning("No se pudo guardar state_path (%s): %s", self.config.state_path, e)
+
+    # ------------------------ Helpers ----------------------------------
+
+    @staticmethod
+    def _parse_week_year_from_text(s: str) -> Tuple[Optional[int], Optional[int]]:
+        # Normaliza: lowercase + decodifica %20 -> espacio, etc.
+        s = unquote(s or "").lower()
+
+        # Captura 'week-37', 'week 37', 'week_37' e incluso 'week37'
+        mw = re.search(r"week(?:[\s_\-]?)(\d{1,2})", s)
+        wy = int(mw.group(1)) if mw else None
+
+        # Año tipo 2025
+        my = re.search(r"(20\d{2})", s)
+        yy = int(my.group(1)) if my else None
+
+        return wy, yy
+
     # ------------------------ Localización del PDF ---------------------
 
-    def _try_direct_weekly_pdf(self) -> Optional[str]:
+    def _try_direct_weekly_pdf(self) -> Optional[Tuple[str, Optional[int], Optional[int]]]:
         """Plan A: URL directa del PDF por semana ISO; retrocede hasta 6 semanas; prueba con y sin cero."""
         today = dt.date.today()
         year, week, _ = today.isocalendar()
@@ -181,26 +224,18 @@ class WeeklyReportAgent:
                     logging.debug("HEAD %s -> %s", url, getattr(h, "status_code", "?"))
                     ct = h.headers.get("Content-Type", "").lower()
                     if h.status_code == 200 and "pdf" in ct:
-                        return url
+                        return url, int(wk), y
                 except requests.RequestException:
                     continue
         return None
 
-    def _scan_listing_page(self) -> Optional[str]:
+    def _scan_listing_page(self) -> Optional[Tuple[str, Optional[int], Optional[int]]]:
         """
         Plan B robusto:
         - Identifica PDFs directos y también páginas de artículo (publications-data / publications-and-data).
         - Entra en artículos, localiza el enlace PDF interno.
-        - Extrae (week, year) del título/URL/PDF; si falta, usa fecha de publicación para desempatar.
+        - Extrae (week, year) del título/URL/PDF (decodificado); si falta, usa slug del artículo y fecha de publicación.
         """
-        def parse_week_year_from_text(s: str) -> Tuple[Optional[int], Optional[int]]:
-            s = (s or "").lower()
-            mw = re.search(r"week[\s\-]?(\d{1,2})", s)
-            wy = int(mw.group(1)) if mw else None
-            my = re.search(r"(20\d{2})", s)
-            yy = int(my.group(1)) if my else None
-            return wy, yy
-
         def fetch_pdf_from_article(url: str) -> Tuple[Optional[str], Optional[int], Optional[int], Optional[str]]:
             try:
                 r = self.session.get(url, timeout=20)
@@ -224,13 +259,13 @@ class WeeklyReportAgent:
                         href = requests.compat.urljoin(url, href)
                     pdf_url = href
                     break
-            # (week, year) desde título/URL y refuerzo con nombre del PDF
+            # (week, year) desde título/URL/PDF (decodificados)
             full_text = " ".join([
                 soup.title.get_text(strip=True) if soup.title else "",
                 url,
                 pdf_url or ""
             ])
-            w, y = parse_week_year_from_text(full_text)
+            w, y = self._parse_week_year_from_text(full_text)
             return pdf_url, w, y, published_iso
 
         # Descargar listado
@@ -242,7 +277,8 @@ class WeeklyReportAgent:
             return None
 
         soup = BeautifulSoup(r.text, "html.parser")
-        candidates: List[Tuple[int, int, str, Optional[str]]] = []  # (year, week, pdf_url, published_iso)
+        # candidatos: (year, week, pdf_url, published_iso)
+        candidates: List[Tuple[int, int, str, Optional[str]]] = []
         article_links: List[str] = []
         direct_pdfs: List[str] = []
 
@@ -264,9 +300,17 @@ class WeeklyReportAgent:
         # a) artículos
         for art in article_links:
             pdf_url, w, y, published_iso = fetch_pdf_from_article(art)
+            # Refuerzo: si falta week/year, intenta con el slug del artículo (decodificado)
+            if w is None or y is None:
+                w2, y2 = self._parse_week_year_from_text(art)
+                if w is None:
+                    w = w2
+                if y is None:
+                    y = y2
+
             if not pdf_url:
                 continue
-            # Verificar (opcional) que responde como PDF
+
             ok = True
             try:
                 h = self.session.head(pdf_url, timeout=12, allow_redirects=True)
@@ -274,18 +318,18 @@ class WeeklyReportAgent:
                 if h.status_code != 200 or "pdf" not in ct:
                     ok = False
             except requests.RequestException:
-                ok = True  # muchos sitios bloquean HEAD; probaremos al descargar
+                ok = True  # permitimos HEAD fallido; ya fallará en descarga si no es PDF
+
             if ok:
-                if y is None:
-                    _, y = parse_week_year_from_text(art)
                 if y is None:
                     y = dt.date.today().year
                 w = w or 0
+                logging.debug("Artículo %s -> PDF %s | week=%s year=%s", art, pdf_url, w, y)
                 candidates.append((y, w, pdf_url, published_iso))
 
         # b) PDFs directos del listado
         for href in direct_pdfs:
-            w, y = parse_week_year_from_text(href)
+            w, y = self._parse_week_year_from_text(href)
             if y is None:
                 y = dt.date.today().year
             w = w or 0
@@ -303,39 +347,35 @@ class WeeklyReportAgent:
             def published_key(iso: Optional[str]) -> float:
                 try:
                     from datetime import datetime
-                    return datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp() if iso else 0.0
+                    return datetime.fromisoformat((iso or "").replace("Z", "+00:00")).timestamp()
                 except Exception:
                     return 0.0
             candidates.sort(key=lambda t: published_key(t[3]), reverse=True)
 
-        return candidates[0][2]
+        best_y, best_w, best_pdf, _ = candidates[0]
+        best_w = best_w if best_w != 0 else None
+        return best_pdf, best_w, best_y
 
-    def fetch_latest_pdf_url(self) -> Optional[str]:
-        """Elige el mejor entre Plan A (rápido) y Plan B (artículos)."""
-        url_a = self._try_direct_weekly_pdf()
-        url_b = self._scan_listing_page()
+    def fetch_latest_pdf(self) -> Optional[Tuple[str, Optional[int], Optional[int]]]:
+        """Elige el mejor entre Plan A (rápido) y Plan B (artículos), devolviendo (url, week, year)."""
+        a = self._try_direct_weekly_pdf()
+        b = self._scan_listing_page()
 
-        def week_year(href: Optional[str]) -> Tuple[int, int]:
-            if not href:
+        def key(t: Optional[Tuple[str, Optional[int], Optional[int]]]) -> Tuple[int, int]:
+            if not t:
                 return (0, 0)
-            m = re.search(r"week[\s\-]?(\d{1,2}).*?(20\d{2})", (href or "").lower())
-            if m:
-                return (int(m.group(1)), int(m.group(2)))
-            # búsqueda relajada por si viene separado
-            mw = re.search(r"week[\s\-]?(\d{1,2})", (href or "").lower())
-            my = re.search(r"(20\d{2})", (href or "").lower())
-            return (int(mw.group(1)) if mw else 0, int(my.group(1)) if my else 0)
+            _, w, y = t
+            return (y or 0, w or 0)
 
-        wa, ya = week_year(url_a)
-        wb, yb = week_year(url_b)
-
-        if url_a and (wa, ya) >= (wb, yb):
-            logging.info("PDF directo seleccionado: %s", url_a)
-            return url_a
-        if url_b:
-            logging.info("PDF extraído de artículo seleccionado: %s", url_b)
-            return url_b
-        return url_a or url_b
+        # preferimos el de mayor (year, week)
+        best = max([x for x in (a, b) if x], key=key, default=None)
+        if best:
+            url, w, y = best
+            if best == a:
+                logging.info("PDF directo seleccionado: %s (week=%s, year=%s)", url, w, y)
+            else:
+                logging.info("PDF extraído de artículo seleccionado: %s (week=%s, year=%s)", url, w, y)
+        return best
 
     # --------------------- Descarga / extracción -----------------------
 
@@ -509,9 +549,18 @@ class WeeklyReportAgent:
     # --------------------------- Run -----------------------------------
 
     def run(self) -> None:
-        pdf_url = self.fetch_latest_pdf_url()
-        if not pdf_url:
+        found = self.fetch_latest_pdf()
+        if not found:
             logging.info("No hay PDF nuevo o no se encontró ninguno.")
+            return
+
+        pdf_url, week, year = found
+
+        # Evitar duplicados
+        state = self._load_state()
+        last_url = state.get("last_pdf_url")
+        if last_url == pdf_url and not self.config.force_send:
+            logging.info("PDF ya enviado previamente y FORCE_SEND!=1. No se reenvía. (%s)", pdf_url)
             return
 
         tmp_path = ""
@@ -560,7 +609,7 @@ class WeeklyReportAgent:
             summary_es = summary_en
 
         html = self.build_html(summary_es, pdf_url)
-        subject = "Resumen del informe semanal del ECDC"
+        subject = f"ECDC CDTR – Week {week} ({year})" if week and year else "Resumen del informe semanal del ECDC"
 
         if self.config.dry_run:
             logging.info("DRY_RUN=1: no se envía email. Asunto: %s", subject)
@@ -571,6 +620,16 @@ class WeeklyReportAgent:
             self.send_email(subject, summary_es, html)
         except Exception as e:
             logging.exception("Fallo enviando el email: %s", e)
+            return
+
+        # Guardar estado
+        state.update({
+            "last_pdf_url": pdf_url,
+            "last_week": week,
+            "last_year": year,
+            "last_sent_utc": dt.datetime.utcnow().isoformat() + "Z",
+        })
+        self._save_state(state)
 
 
 # ---------------------------------------------------------------------
@@ -584,3 +643,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
