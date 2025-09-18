@@ -214,64 +214,322 @@ class WeeklyReportAgent:
         )
         return html
 
-    # ------------------ HTML enriquecido (adjunto) ------------------
+    # ------------------ HTML enriquecido (adjunto) - NUEVO FORMATO ------------------
 
     def build_rich_html_attachment(self, week_label: str, gen_date_es: str) -> str:
         html = f"""<!DOCTYPE html>
 <html lang="es">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Resumen Semanal de Amenazas de Enfermedades Transmisibles - {week_label}</title>
-<style>
-body {{
-  font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-  line-height: 1.6; color: #333; max-width: 1000px; margin: 0 auto;
-  padding: 20px; background-color: #f9f9f9;
-}}
-.header {{ text-align: center; margin-bottom: 30px; padding-bottom: 20px; border-bottom: 3px solid #2b6ca3; }}
-.header h1 {{ color: #2b6ca3; margin-bottom: 5px; }}
-.header .subtitle {{ color: #666; font-size: 1.2em; }}
-.header .week {{ background-color: #2b6ca3; color: white; display: inline-block; padding: 5px 10px; border-radius: 4px; margin-top: 10px; }}
-.highlight-box {{ background-color: #e8f4ff; border-left: 5px solid #2b6ca3; padding: 15px; margin: 20px 0; border-radius: 4px; }}
-.spain-highlight {{ background-color: #fff3cd; border-left: 5px solid #ffc107; padding: 15px; margin: 20px 0; border-radius: 4px; }}
-.spain-highlight h3 {{ color: #856404; margin-top: 0; display: flex; align-items: center; }}
-.spain-highlight h3:before {{ content: "🇪🇸"; margin-right: 10px; }}
-.section {{ margin-bottom: 30px; background-color: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }}
-.section h2 {{ color: #2b6ca3; border-bottom: 2px solid #eaeaea; padding-bottom: 10px; margin-top: 0; }}
-.stats-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 15px; margin: 15px 0; }}
-.stat-card {{ background: #f8f9fa; padding: 15px; border-radius: 8px; text-align: center; border: 1px solid #eaeaea; }}
-.stat-card .number {{ font-size: 1.8em; font-weight: bold; color: #2b6ca3; }}
-.stat-card .label {{ font-size: 0.9em; color: #666; }}
-.key-points {{ background-color: #f8f9fa; padding: 15px; border-radius: 8px; margin: 15px 0; }}
-.key-points ul {{ padding-left: 20px; margin: 0; }}
-.key-points li {{ margin-bottom: 8px; }}
-.footer {{ text-align: center; margin-top: 30px; padding-top: 20px; border-top: 1px solid #eaeaea; color: #666; font-size: 0.9em; }}
-.tag {{ display: inline-block; padding: 3px 8px; border-radius: 4px; font-size: 0.8em; margin-right: 5px; background-color: #e9ecef; color: #495057; }}
-.risk-low {{ background-color: #d4edda; color: #155724; }}
-.risk-moderate {{ background-color: #fff3cd; color: #856404; }}
-.risk-high {{ background-color: #f8d7da; color: #721c24; }}
-</style>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Resumen Semanal ECDC - {week_label}</title>
+    <style>
+        * {{
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        }}
+        body {{
+            background-color: #f5f7fa;
+            color: #333;
+            line-height: 1.6;
+            padding: 20px;
+            max-width: 1200px;
+            margin: 0 auto;
+        }}
+        .header {{
+            text-align: center;
+            padding: 20px;
+            background: linear-gradient(135deg, #2b6ca3 0%, #1a4e7a 100%);
+            color: white;
+            border-radius: 10px;
+            margin-bottom: 25px;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+        }}
+        .header h1 {{
+            font-size: 2.2rem;
+            margin-bottom: 10px;
+        }}
+        .header .subtitle {{
+            font-size: 1.2rem;
+            margin-bottom: 15px;
+            opacity: 0.9;
+        }}
+        .header .week {{
+            background-color: rgba(255, 255, 255, 0.2);
+            display: inline-block;
+            padding: 8px 16px;
+            border-radius: 30px;
+            font-weight: 600;
+        }}
+        .container {{
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+        }}
+        @media (max-width: 900px) {{
+            .container {{
+                grid-template-columns: 1fr;
+            }}
+        }}
+        .card {{
+            background: white;
+            border-radius: 10px;
+            padding: 20px;
+            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.05);
+            transition: transform 0.3s ease;
+        }}
+        .card:hover {{
+            transform: translateY(-5px);
+            box-shadow: 0 6px 12px rgba(0, 0, 0, 0.1);
+        }}
+        .card h2 {{
+            color: #2b6ca3;
+            border-bottom: 2px solid #eaeaea;
+            padding-bottom: 10px;
+            margin-bottom: 15px;
+            font-size: 1.4rem;
+        }}
+        .spain-card {{
+            border-left: 5px solid #c60b1e;
+            background-color: #fff9f9;
+        }}
+        .spain-card h2 {{
+            color: #c60b1e;
+            display: flex;
+            align-items: center;
+        }}
+        .spain-card h2:before {{
+            content: "🇪🇸";
+            margin-right: 10px;
+        }}
+        .stat-grid {{
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 15px;
+            margin: 15px 0;
+        }}
+        .stat-box {{
+            background: #f8f9fa;
+            padding: 15px;
+            border-radius: 8px;
+            text-align: center;
+            border: 1px solid #eaeaea;
+        }}
+        .stat-box .number {{
+            font-size: 1.8rem;
+            font-weight: bold;
+            color: #2b6ca3;
+            margin-bottom: 5px;
+        }}
+        .stat-box .label {{
+            font-size: 0.9rem;
+            color: #666;
+        }}
+        .spain-stat .number {{
+            color: #c60b1e;
+        }}
+        .key-points {{
+            background-color: #e8f4ff;
+            padding: 15px;
+            border-radius: 8px;
+            margin: 15px 0;
+        }}
+        .key-points h3 {{
+            margin-bottom: 10px;
+            color: #2b6ca3;
+        }}
+        .key-points ul {{
+            padding-left: 20px;
+        }}
+        .key-points li {{
+            margin-bottom: 8px;
+        }}
+        .risk-tag {{
+            display: inline-block;
+            padding: 5px 12px;
+            border-radius: 20px;
+            font-size: 0.85rem;
+            font-weight: 600;
+            margin-top: 10px;
+        }}
+        .risk-low {{
+            background-color: #d4edda;
+            color: #155724;
+        }}
+        .risk-moderate {{
+            background-color: #fff3cd;
+            color: #856404;
+        }}
+        .risk-high {{
+            background-color: #f8d7da;
+            color: #721c24;
+        }}
+        .full-width {{
+            grid-column: 1 / -1;
+        }}
+        .footer {{
+            text-align: center;
+            margin-top: 30px;
+            padding-top: 20px;
+            border-top: 1px solid #eaeaea;
+            color: #666;
+            font-size: 0.9rem;
+        }}
+        .topic-list {{
+            list-style-type: none;
+        }}
+        .topic-list li {{
+            padding: 8px 0;
+            border-bottom: 1px solid #f0f0f0;
+        }}
+        .topic-list li:last-child {{
+            border-bottom: none;
+        }}
+    </style>
 </head>
 <body>
-<div class="header">
-  <h1>Resumen Semanal de Amenazas de Enfermedades Transmisibles</h1>
-  <div class="subtitle">Centro Europeo para la Prevención y el Control de Enfermedades (ECDC)</div>
-  <div class="week">{week_label}</div>
-</div>
+    <div class="header">
+        <h1>Resumen Semanal de Amenazas de Enfermedades Transmisibles</h1>
+        <div class="subtitle">Centro Europeo para la Prevención y el Control de Enfermedades (ECDC)</div>
+        <div class="week">{week_label}</div>
+    </div>
 
-<div class="highlight-box">
-  <h2>Resumen Ejecutivo</h2>
-  <p>La actividad de virus respiratorios en la UE/EEA se mantiene en niveles bajos o basales tras el verano, con incrementos graduales de SARS-CoV-2 pero con hospitalizaciones y muertes por debajo del mismo período de 2024. Se reportan nuevos casos humanos de gripe aviar A(H9N2) en China y un brote de Ébola en la República Democrática del Congo. Continúa la vigilancia estacional de enfermedades transmitidas por vectores (WNV, dengue, chikungunya, CCHF).</p>
-</div>
+    <div class="container">
+        <div class="card full-width">
+            <h2>Resumen Ejecutivo</h2>
+            <p>La actividad de virus respiratorios en la UE/EEA se mantiene en niveles bajos o basales tras el verano, con incrementos graduales de SARS-CoV-2 pero con hospitalizaciones y muertes por debajo del mismo período de 2024. Se reportan nuevos casos humanos de gripe aviar A(H9N2) en China y un brote de Ébola en la República Democrática del Congo. Continúa la vigilancia estacional de enfermedades transmitidas por vectores (WNV, dengue, chikungunya, CCHF).</p>
+        </div>
 
-<!-- Aquí puedes pegar el resto de tu contenido enriquecido -->
+        <div class="card spain-card full-width">
+            <h2>Datos Destacados para España</h2>
+            <div class="stat-grid">
+                <div class="stat-box spain-stat">
+                    <div class="number">5</div>
+                    <div class="label">Casos de Virus del Nilo Occidental</div>
+                </div>
+                <div class="stat-box spain-stat">
+                    <div class="number">3</div>
+                    <div class="label">Casos de Fiebre Hemorrágica de Crimea-Congo</div>
+                </div>
+                <div class="stat-box spain-stat">
+                    <div class="number">1</div>
+                    <div class="label">Brote aviar de WNV (Almería)</div>
+                </div>
+                <div class="stat-box spain-stat">
+                    <div class="number">0</div>
+                    <div class="label">Nuevos casos de CCHF esta semana</div>
+                </div>
+            </div>
+        </div>
 
-<div class="footer">
-  <p>Resumen generado el: {gen_date_es}</p>
-  <p>Fuente: ECDC Weekly Communicable Disease Threats Report</p>
-  <p>Este es un resumen automático. Para información detallada, consulte el informe completo.</p>
-</div>
+        <div class="card">
+            <h2>Virus Respiratorios en la UE/EEA</h2>
+            <div class="key-points">
+                <h3>Puntos Clave:</h3>
+                <ul>
+                    <li>Positividad de SARS-CoV-2 en atención primaria: <strong>22.3%</strong></li>
+                    <li>Positividad de SARS-CoV-2 en hospitalarios: <strong>10%</strong></li>
+                    <li>Actividad de influenza: <strong>2.1%</strong> en atención primaria</li>
+                    <li>Actividad de VRS: <strong>1.2%</strong> en atención primaria</li>
+                </ul>
+            </div>
+            <p><strong>Evaluación de riesgo:</strong> Aumento gradual de SARS-CoV-2 pero con impacto sanitario limitado.</p>
+            <div class="risk-tag risk-low">RIESGO BAJO</div>
+        </div>
+
+        <div class="card">
+            <h2>Gripe Aviar A(H9N2) - China</h2>
+            <p>Se reportaron 4 nuevos casos en niños en China (9 de septiembre).</p>
+            <div class="key-points">
+                <h3>Datos Globales:</h3>
+                <ul>
+                    <li>Total de casos desde 1998: <strong>177 casos</strong> en 10 países</li>
+                    <li>Casos en 2025: <strong>26 casos</strong> (todos en China)</li>
+                    <li>Tasa de letalidad: <strong>1.13%</strong> (2 muertes)</li>
+                </ul>
+            </div>
+            <div class="risk-tag risk-low">RIESGO MUY BAJO para UE/EEA</div>
+        </div>
+
+        <div class="card">
+            <h2>Virus del Nilo Occidental (WNV)</h2>
+            <div class="key-points">
+                <h3>Datos Europeos:</h3>
+                <ul>
+                    <li><strong>652</strong> casos autóctonos en humanos</li>
+                    <li><strong>38</strong> muertes (tasa de letalidad: 6%)</li>
+                    <li><strong>9</strong> países reportando casos humanos</li>
+                </ul>
+            </div>
+            <p><strong>Países más afectados:</strong> Italia (500), Grecia (69), Serbia (33), Francia (20)</p>
+        </div>
+
+        <div class="card">
+            <h2>Otras Enfermedades Transmitidas por Vectores</h2>
+            <div class="stat-grid">
+                <div class="stat-box">
+                    <div class="number">21</div>
+                    <div class="label">Dengue (Francia)</div>
+                </div>
+                <div class="stat-box">
+                    <div class="number">4</div>
+                    <div class="label">Dengue (Italia)</div>
+                </div>
+                <div class="stat-box">
+                    <div class="number">383</div>
+                    <div class="label">Chikungunya (Francia)</div>
+                </div>
+                <div class="stat-box">
+                    <div class="number">167</div>
+                    <div class="label">Chikungunya (Italia)</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>Ébola - República Democrática del Congo</h2>
+            <div class="key-points">
+                <h3>Datos del Brote:</h3>
+                <ul>
+                    <li><strong>68</strong> casos sospechosos</li>
+                    <li><strong>16</strong> muertes (tasa de letalidad: 23.5%)</li>
+                    <li>Confirmado como cepa Zaire de Ébola</li>
+                </ul>
+            </div>
+            <div class="risk-tag risk-low">RIESGO MUY BAJO para UE/EEA</div>
+        </div>
+
+        <div class="card">
+            <h2>Sarampión - Vigilancia Mensual</h2>
+            <div class="key-points">
+                <h3>Datos de la UE/EEA (Julio 2025):</h3>
+                <ul>
+                    <li><strong>188 casos</strong> reportados en julio</li>
+                    <li><strong>13 países</strong> reportaron casos</li>
+                    <li><strong>8 muertes</strong> en los últimos 12 meses</li>
+                    <li><strong>83.3%</strong> de casos no vacunados</li>
+                </ul>
+            </div>
+            <p><strong>Tendencia:</strong> Disminución general de casos.</p>
+        </div>
+
+        <div class="card full-width">
+            <h2>Temas Adicionales del Informe</h2>
+            <ul class="topic-list">
+                <li><strong>Malaria - Grecia:</strong> 2 casos con probable transmisión local y 1 caso con origen indeterminado</li>
+                <li><strong>Vigilancia estacional:</strong> Se mantiene la vigilancia de dengue, chikungunya y fiebre hemorrágica de Crimea-Congo</li>
+                <li><strong>Eventos en monitorización activa:</strong> Incluyen polio, rabia, fiebre de Lassa y variantes de SARS-CoV-2</li>
+            </ul>
+        </div>
+    </div>
+
+    <div class="footer">
+        <p>Resumen generado el: {gen_date_es}</p>
+        <p>Fuente: ECDC Weekly Communicable Disease Threats Report</p>
+        <p>Este es un resumen automático. Para información detallada, consulte el informe completo.</p>
+    </div>
 </body>
 </html>
 """
