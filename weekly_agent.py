@@ -134,8 +134,23 @@ class WeeklyReportAgent:
 
     # ------------------ HTML enriquecido (CUERPO del correo) ------------------
 
-    def build_rich_html_body(self, week_label: str, gen_date_es: str) -> str:
-        # === TU PLANTILLA RICA (exactamente la que quieres ver en el correo) ===
+    def build_rich_html_body(self, week_label: str, gen_date_es: str, pdf_url: str, article_url: str) -> str:
+        # CTA común (botón compatible con la mayoría de clientes)
+        cta = f"""
+        <div style="text-align:center;margin:18px 0 6px">
+          <a href="{pdf_url}" target="_blank"
+             style="display:inline-block;background:#0b5cab;color:#fff;text-decoration:none;
+                    padding:12px 18px;border-radius:8px;font-weight:700">
+            Abrir / Descargar PDF del informe
+          </a>
+        </div>
+        <div style="text-align:center;font-size:12px;color:#6b7280;margin-top:4px">
+          Si el botón no funciona, copia y pega este enlace en tu navegador:<br>
+          <span style="word-break:break-all">{pdf_url}</span>
+        </div>
+        """
+
+        # === PLANTILLA RICA (incluye CTA al PDF y fuente) ===
         return f"""<!DOCTYPE html>
 <html lang="es">
 <head>
@@ -192,6 +207,8 @@ body {{ background:#f5f7fa; color:#333; line-height:1.6; padding:20px; max-width
     <div class="subtitle">Centro Europeo para la Prevención y el Control de Enfermedades (ECDC)</div>
     <div class="week">{week_label}</div>
   </div>
+
+  {cta}
 
   <div class="container">
     <div class="card full-width">
@@ -295,8 +312,7 @@ body {{ background:#f5f7fa; color:#333; line-height:1.6; padding:20px; max-width
 
   <div class="footer">
     <p>Resumen generado el: {gen_date_es}</p>
-    <p>Fuente: ECDC Weekly Communicable Disease Threats Report</p>
-    <p>Este es un resumen automático. Para información detallada, consulte el informe completo.</p>
+    <p>Fuente: <a href="{article_url}" target="_blank" style="color:#0b5cab">Página del informe (ECDC)</a></p>
   </div>
 </body>
 </html>
@@ -317,17 +333,13 @@ body {{ background:#f5f7fa; color:#333; line-height:1.6; padding:20px; max-width
         if not to_addresses:
             raise ValueError("RECEIVER_EMAIL vacío tras el parseo.")
 
-        # Solo alternative: primero texto plano mínimo, luego HTML rico
         msg = MIMEMultipart('alternative')
         msg['Subject'] = subject
         msg['From'] = self.config.sender_email
         msg['To'] = ", ".join(to_addresses)
 
-        # Texto plano mínimo (compatibilidad)
         minimal_plain = plain_text or "Ver versión HTML."
         msg.attach(MIMEText(minimal_plain, 'plain', 'utf-8'))
-
-        # HTML rico (tu plantilla)
         msg.attach(MIMEText(html_body, 'html', 'utf-8'))
 
         logging.info("SMTP: from=%s → to=%s", self.config.sender_email, to_addresses)
@@ -366,13 +378,14 @@ body {{ background:#f5f7fa; color:#333; line-height:1.6; padding:20px; max-width
 
         week_label = f"Semana {week}: fechas según CDTR" if week else "Último informe"
         gen_date_es = fecha_es(dt.datetime.utcnow())
-        rich_html_body = self.build_rich_html_body(week_label, gen_date_es)
+        rich_html_body = self.build_rich_html_body(week_label, gen_date_es, pdf_url, article_url)
 
         subject = f"ECDC CDTR – {'Semana ' + str(week) if week else 'Último'} ({year or dt.date.today().year})"
-        plain = ""  # vacío → no estorba; mantenemos parte 'plain' mínima por compatibilidad
+        plain = ""  # parte texto mínima
 
         if self.config.dry_run:
             logging.info("DRY_RUN=1: no envío. Asunto: %s | HTML length=%d", subject, len(rich_html_body))
+            logging.info("PDF URL: %s | Article URL: %s", pdf_url, article_url)
             return
 
         try:
@@ -389,4 +402,5 @@ body {{ background:#f5f7fa; color:#333; line-height:1.6; padding:20px; max-width
 if __name__ == "__main__":
     cfg = Config()
     WeeklyReportAgent(cfg).run()
+
 
