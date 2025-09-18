@@ -5,7 +5,6 @@ import os
 import re
 import ssl
 import json
-import base64
 import smtplib
 import logging
 import datetime as dt
@@ -15,7 +14,6 @@ from urllib.parse import urljoin, unquote
 
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from email.mime.image import MIMEImage
 
 # ---------------------------------------------------------------------
 # Configuración
@@ -39,6 +37,19 @@ class Config:
 
 
 # ---------------------------------------------------------------------
+# Utilidades
+# ---------------------------------------------------------------------
+
+MESES_ES = {
+    1: "enero", 2: "febrero", 3: "marzo", 4: "abril", 5: "mayo", 6: "junio",
+    7: "julio", 8: "agosto", 9: "septiembre", 10: "octubre", 11: "noviembre", 12: "diciembre"
+}
+
+def fecha_es(dt_utc: dt.datetime) -> str:
+    return f"{dt_utc.day} de {MESES_ES.get(dt_utc.month, 'mes')} de {dt_utc.year} (UTC)"
+
+
+# ---------------------------------------------------------------------
 # Agente
 # ---------------------------------------------------------------------
 
@@ -55,30 +66,6 @@ class WeeklyReportAgent:
                           "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
             "Accept": "text/html,application/xhtml+xml,application/pdf,*/*;q=0.8",
         })
-
-        # Iconos (círculos de color 16x16) como bytes (no data:), para inline CID
-        self.icon_pngs = {
-            "icon_green": base64.b64decode(
-                "iVBORw0KGgoAAAANSUhEUgAAAA4AAAAOCAYAAAAfSC3RAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAV0lEQVQokWP8////fwY0"
-                "gImJCSYGBgZGRgYGKkZGRv4H4g1gYGB4YGBg2DgQkRMQGgQwQGg0gA2gQkQbQAjQGQbwF0GgYkGQZgKkA2gJgB0m2p8bC9k"
-                "AAJm6b1S1xK8kAAAAAElFTkSuQmCC"
-            ),
-            "icon_blue": base64.b64decode(
-                "iVBORw0KGgoAAAANSUhEUgAAAA4AAAAOCAYAAAAfSC3RAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAWElEQVQokWP8////fwY0"
-                "gImJCTYGJgYmBjZGQGBgYGBg2LhQkRMQGgQwQGg0gA2gQkQbQAjQGQbwF0GgYkGQZgKkA2gJgB0i0XcQkQbQJQGgZnE6tqj"
-                "AAAXb2F6qf6mQAAAAAElFTkSuQmCC"
-            ),
-            "icon_red": base64.b64decode(
-                "iVBORw0KGgoAAAANSUhEUgAAAA4AAAAOCAYAAAAfSC3RAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAWElEQVQokWP8////fwY0"
-                "gImJCTYGJgYmBjZGQGBgYGBg2LhQkRMQGgQwQGg0gA2gQkQbQAjQGQbwF0GgYkGQZgKkA2gJgB0mNQ2r8kQbQJQGgZu3Zkqg"
-                "AAyO6P5rJ4mIcAAAAASUVORK5CYII="
-            ),
-            "icon_orange": base64.b64decode(
-                "iVBORw0KGgoAAAANSUhEUgAAAA4AAAAOCAYAAAAfSC3RAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAV0lEQVQokWP8////fwY0"
-                "gImJCSYGBgZGRgYGKkZGRv4H4g1gYGB4YGBg2DgQkRMQGgQwQGg0gA2gQkQbQAjQGQbwF0GgYkGQZgKkA2gJgB0m7pQk4x5g"
-                "AANw2p2s8n0nQAAAAAElFTkSuQmCC"
-            ),
-        }
 
     # ------------------ Localización PDF ------------------
 
@@ -145,12 +132,16 @@ class WeeklyReportAgent:
         with open(self.config.state_file, "w") as f:
             json.dump(state, f)
 
-    # ------------------ HTML email-safe con CIDs ------------------
+    # ------------------ HTML email-safe (sin imágenes, con “círculos” CSS) ------------------
 
     def build_email_safe_html(self, pdf_url: str, article_url: str, week, year) -> str:
         period_label = f"Semana {week} · {year}" if week and year else "Último informe ECDC"
 
-        def card(cid, chip_text, title_text, body_html, border_color, bg_color):
+        def circle(color):
+            return (f"<span style='display:inline-block;width:12px;height:12px;border-radius:50%;"
+                    f"background:{color};vertical-align:middle;margin-right:6px'></span>")
+
+        def card(color, chip_text, title_text, body_html, border_color, bg_color):
             return (
                 "<table role='presentation' width='100%' cellspacing='0' cellpadding='0' "
                 f"style='margin:12px 0;border-left:6px solid {border_color};background:{bg_color};"
@@ -159,7 +150,7 @@ class WeeklyReportAgent:
                 "<table role='presentation' cellspacing='0' cellpadding='0' width='100%'>"
                 "<tr>"
                 "<td valign='top' width='20' style='padding-right:8px'>"
-                f"<img src='cid:{cid}' width='16' height='16' alt='' style='display:block;border:0;outline:none;'>"
+                f"{circle(color)}"
                 "</td>"
                 "<td>"
                 f"<div style='font-size:12px;font-weight:700;letter-spacing:.3px;color:{border_color};text-transform:uppercase;margin-bottom:4px'>{chip_text}</div>"
@@ -181,18 +172,18 @@ class WeeklyReportAgent:
             "<tr><td style='padding:0 18px'>"
         )
 
-        html += card("icon_green", "Virus del Nilo Occidental",
+        html += card("#2e7d32", "Virus del Nilo Occidental",
                      "652 casos humanos y 38 muertes en Europa (acumulado a 3-sep)",
                      "Italia concentra la mayoría de casos;&nbsp;"
                      "<span style='background:#fff7d6;padding:2px 4px;border-radius:4px;border-left:4px solid #ff9800'>🇪🇸 España: 5 casos humanos y 3 brotes en équidos/aves</span>.",
                      "#2e7d32", "#f0f7f2")
 
-        html += card("icon_red", "Fiebre Crimea-Congo (CCHF)",
+        html += card("#d32f2f", "Fiebre Crimea-Congo (CCHF)",
                      "Sin nuevos casos esta semana",
                      "<span style='background:#fff7d6;padding:2px 4px;border-radius:4px;border-left:4px solid #ff9800'>🇪🇸 España: 3 casos en 2025</span>; Grecia 2 casos.",
                      "#d32f2f", "#fbf1f1")
 
-        html += card("icon_blue", "Respiratorios",
+        html += card("#1565c0", "Respiratorios",
                      "COVID-19 al alza en detección; Influenza y VRS en niveles bajos",
                      "<span style='background:#fff7d6;padding:2px 4px;border-radius:4px;border-left:4px solid #ff9800'>🇪🇸 España</span>: descenso de positividad SARI por SARS-CoV-2.",
                      "#1565c0", "#eef4fb")
@@ -203,16 +194,13 @@ class WeeklyReportAgent:
             "<div style='font-weight:800;color:#333;margin:10px 0 8px'>Puntos clave</div>"
             "<table role='presentation' width='100%' cellspacing='0' cellpadding='0'>"
             "<tr><td style='border-left:6px solid #2e7d32;padding:6px 10px;font-size:14px'>"
-            "<img src='cid:icon_green' width='12' height='12' alt='' style='vertical-align:middle;margin-right:6px'>"
-            "Expansión estacional en 9 países; mortalidad global ~6%."
+            f"{circle('#2e7d32')}Expansión estacional en 9 países; mortalidad global ~6%."
             "</td></tr>"
             "<tr><td style='border-left:6px solid #ef6c00;padding:6px 10px;font-size:14px'>"
-            "<img src='cid:icon_orange' width='12' height='12' alt='' style='vertical-align:middle;margin-right:6px'>"
-            "Dengue autóctono en Francia/Italia/Portugal; sin casos en España."
+            f"{circle('#ef6c00')}Dengue autóctono en Francia/Italia/Portugal; sin casos en España."
             "</td></tr>"
             "<tr><td style='border-left:6px solid #1565c0;padding:6px 10px;font-size:14px'>"
-            "<img src='cid:icon_blue' width='12' height='12' alt='' style='vertical-align:middle;margin-right:6px'>"
-            "A(H9N2) esporádico en Asia; riesgo UE/EEE: muy bajo."
+            f"{circle('#1565c0')}A(H9N2) esporádico en Asia; riesgo UE/EEE: muy bajo."
             "</td></tr>"
             "</table>"
             "</td></tr>"
@@ -226,10 +214,9 @@ class WeeklyReportAgent:
         )
         return html
 
-    # ------------------ HTML enriquecido (adjunto correcto) ------------------
+    # ------------------ HTML enriquecido (adjunto) ------------------
 
     def build_rich_html_attachment(self, week_label: str, gen_date_es: str) -> str:
-        # CSS con llaves simples (válido); sin placeholders dobles.
         html = f"""<!DOCTYPE html>
 <html lang="es">
 <head>
@@ -290,9 +277,9 @@ body {{
 """
         return html
 
-    # ------------------ Envío email con estructura MIME robusta ------------------
+    # ------------------ Envío email (multipart/alternative + adjunto) ------------------
 
-    def send_email(self, subject, plain_text, html_body, inline_images, attachment_html=None, attachment_name="resumen_ecdc.html"):
+    def send_email(self, subject, plain_text, html_body, attachment_html=None, attachment_name="resumen_ecdc.html"):
         if not self.config.sender_email or not self.config.receiver_email:
             raise ValueError("Faltan SENDER_EMAIL o RECEIVER_EMAIL.")
         if not self.config.smtp_server:
@@ -306,38 +293,27 @@ body {{
         if not to_addresses:
             raise ValueError("RECEIVER_EMAIL vacío tras el parseo.")
 
-        # Root: mixed
-        msg_root = MIMEMultipart('mixed')
+        # Root: mixed si hay adjunto; si no, alternative
+        root_kind = 'mixed' if attachment_html else 'alternative'
+        msg_root = MIMEMultipart(root_kind)
         msg_root['Subject'] = subject
         msg_root['From'] = self.config.sender_email
         msg_root['To'] = ", ".join(to_addresses)
 
-        # alternative (plain + related)
-        msg_alt = MIMEMultipart('alternative')
-        msg_root.attach(msg_alt)
+        if root_kind == 'mixed':
+            # Cuerpo alternative dentro de mixed
+            msg_alt = MIMEMultipart('alternative')
+            msg_root.attach(msg_alt)
+            msg_alt.attach(MIMEText(plain_text or "(vacío)", 'plain', 'utf-8'))
+            msg_alt.attach(MIMEText(html_body, 'html', 'utf-8'))
 
-        # plain
-        msg_alt.attach(MIMEText(plain_text or "(vacío)", 'plain', 'utf-8'))
-
-        # related (html + imágenes inline)
-        msg_rel = MIMEMultipart('related')
-        msg_alt.attach(msg_rel)
-
-        # html
-        msg_rel.attach(MIMEText(html_body, 'html', 'utf-8'))
-
-        # imágenes inline
-        for cid, binary in inline_images.items():
-            img = MIMEImage(binary, name=f"{cid}.png")
-            img.add_header('Content-ID', f"<{cid}>")
-            img.add_header('Content-Disposition', 'inline', filename=f"{cid}.png")
-            msg_rel.attach(img)
-
-        # adjunto opcional: HTML enriquecido
-        if attachment_html:
+            # Adjunto HTML enriquecido
             attach_part = MIMEText(attachment_html, 'html', 'utf-8')
             attach_part.add_header('Content-Disposition', 'attachment', filename=attachment_name)
             msg_root.attach(attach_part)
+        else:
+            msg_root.attach(MIMEText(plain_text or "(vacío)", 'plain', 'utf-8'))
+            msg_root.attach(MIMEText(html_body, 'html', 'utf-8'))
 
         logging.info("SMTP: from=%s → to=%s", self.config.sender_email, to_addresses)
 
@@ -377,12 +353,12 @@ body {{
             logging.info("El PDF ya fue enviado previamente, no se reenvía.")
             return
 
-        # Cuerpo HTML email-safe (con CIDs)
+        # Cuerpo HTML (círculos CSS, sin imágenes)
         email_html = self.build_email_safe_html(pdf_url, article_url, week, year)
 
         # Adjunto enriquecido
         week_label = f"Semana {week}: fechas según CDTR" if week else "Último informe"
-        gen_date_es = dt.datetime.utcnow().strftime("%d de %B de %Y (UTC)")
+        gen_date_es = fecha_es(dt.datetime.utcnow())
         rich_html = self.build_rich_html_attachment(week_label, gen_date_es)
 
         subject = f"ECDC CDTR – {'Semana ' + str(week) if week else 'Último'} ({year or dt.date.today().year})"
@@ -398,7 +374,6 @@ body {{
                 subject=subject,
                 plain_text=plain,
                 html_body=email_html,
-                inline_images=self.icon_pngs,   # CIDs: icon_green, icon_blue, icon_red, icon_orange
                 attachment_html=rich_html,
                 attachment_name="resumen_ecdc.html"
             )
@@ -414,4 +389,3 @@ body {{
 if __name__ == "__main__":
     cfg = Config()
     WeeklyReportAgent(cfg).run()
-
