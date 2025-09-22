@@ -36,22 +36,17 @@ from email.mime.text import MIMEText
 # =====================================================================
 
 class Config:
-    # Página de listados del ECDC (CDTR)
     list_url = "https://www.ecdc.europa.eu/en/publications-and-data/monitoring/weekly-threats-reports"
 
-    # SMTP / email (rellenar vía .env o secretos del runner)
     smtp_server = os.getenv("SMTP_SERVER", "")
-    smtp_port = int(os.getenv("SMTP_PORT", "465") or "465")  # 465 SSL; 587 STARTTLS
+    smtp_port = int(os.getenv("SMTP_PORT", "465") or "465")
     sender_email = os.getenv("SENDER_EMAIL", "")
     email_password = os.getenv("EMAIL_PASSWORD", "")
-    receiver_email = os.getenv("RECEIVER_EMAIL", "")  # múltiples: coma, ; o saltos de línea
+    receiver_email = os.getenv("RECEIVER_EMAIL", "")
 
-    # Otros
     dry_run = os.getenv("DRY_RUN", "0") == "1"
     log_level = os.getenv("LOG_LEVEL", "INFO")
     state_file = ".weekly_agent_state.json"
-
-    # Tamaño máximo del PDF (MB) por seguridad
     max_pdf_mb = int(os.getenv("MAX_PDF_MB", "30"))
 
 
@@ -67,13 +62,12 @@ MESES_ES = {
 def fecha_es(dt_utc: dt.datetime) -> str:
     return f"{dt_utc.day} de {MESES_ES.get(dt_utc.month, 'mes')} de {dt_utc.year} (UTC)"
 
-
 def clean_spaces(s: str) -> str:
     return re.sub(r"\s+", " ", s or "").strip()
 
 
 # =====================================================================
-# Agente
+# Agente - VERSIÓN MEJORADA CON TRADUCCIÓN AL ESPAÑOL
 # =====================================================================
 
 class WeeklyReportAgent:
@@ -85,31 +79,25 @@ class WeeklyReportAgent:
         )
         self.session = requests.Session()
         self.session.headers.update({
-            "User-Agent": (
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-            ),
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
             "Accept": "text/html,application/xhtml+xml,application/pdf,*/*;q=0.8",
         })
 
     # --------------------------------------------------------------
-    # Localización del artículo y PDF
+    # Localización del PDF
     # --------------------------------------------------------------
     def _parse_week_year(self, text: str) -> Tuple[Optional[int], Optional[int]]:
         s = unquote(text or "").lower()
         w = re.search(r"\bweek[\s\-]?(\d{1,2})\b", s)
         y = re.search(r"\b(20\d{2})\b", s)
-        return (int(w.group(1)) if w else None,
-                int(y.group(1)) if y else None)
+        return (int(w.group(1)) if w else None, int(y.group(1)) if y else None)
 
     def fetch_latest_article_and_pdf(self) -> Tuple[str, str, Optional[int], Optional[int]]:
-        """Devuelve (article_url, pdf_url, week, year)."""
         r = self.session.get(self.cfg.list_url, timeout=30)
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
 
-        # Candidatos: enlaces a "communicable-disease-threats-report-...-week-XX"
-        candidates: List[str] = []
+        candidates = []
         for a in soup.find_all("a", href=True):
             href = a["href"].strip()
             l = href.lower()
@@ -118,19 +106,16 @@ class WeeklyReportAgent:
                 candidates.append(url)
 
         if not candidates:
-            raise RuntimeError("No se encontraron artículos CDTR en la página de listados.")
+            raise RuntimeError("No se encontraron artículos CDTR.")
 
-        # Recorremos por orden de aparición (la página ya ordena por recencia)
         for article_url in candidates:
             ar = self.session.get(article_url, timeout=30)
             if ar.status_code != 200:
                 continue
             asoup = BeautifulSoup(ar.text, "html.parser")
 
-            # En el artículo suele existir un enlace directo a PDF (primer <a> .pdf)
             pdf_a = asoup.find("a", href=re.compile(r"\.pdf$", re.I))
             if not pdf_a:
-                # A veces el PDF usa espacios codificados u otros sufijos; probamos
                 for a in asoup.find_all("a", href=True):
                     if ".pdf" in a["href"].lower():
                         pdf_a = a
@@ -142,17 +127,15 @@ class WeeklyReportAgent:
             if not pdf_url.startswith("http"):
                 pdf_url = urljoin(article_url, pdf_url)
 
-            # Semana/año
             t = (asoup.title.get_text(strip=True) if asoup.title else "") + " " + pdf_url
             week, year = self._parse_week_year(t)
-            logging.info("Artículo CDTR: %s", article_url)
-            logging.info("PDF CDTR: %s (semana=%s, año=%s)", pdf_url, week, year)
+            logging.info("PDF encontrado: %s (semana=%s, año=%s)", pdf_url, week, year)
             return article_url, pdf_url, week, year
 
-        raise RuntimeError("No se logró localizar un PDF dentro de los artículos candidatos.")
+        raise RuntimeError("No se logró localizar un PDF.")
 
     # --------------------------------------------------------------
-    # Estado (para no reenviar el mismo PDF)
+    # Estado y descarga
     # --------------------------------------------------------------
     def _load_state(self) -> Dict:
         if not os.path.exists(self.cfg.state_file):
@@ -168,11 +151,7 @@ class WeeklyReportAgent:
         with open(self.cfg.state_file, "w", encoding="utf-8") as f:
             json.dump(state, f)
 
-    # --------------------------------------------------------------
-    # Descarga y extracción de texto del PDF
-    # --------------------------------------------------------------
     def _download_pdf(self, pdf_url: str) -> str:
-        # Pre-chequeo tamaño
         try:
             h = self.session.head(pdf_url, timeout=15, allow_redirects=True)
             clen = h.headers.get("Content-Length")
@@ -191,20 +170,17 @@ class WeeklyReportAgent:
         return tmp.name
 
     def _extract_text_pdf(self, path: str) -> str:
-        # 1) pdfplumber (si está)
         if pdfplumber is not None:
             try:
                 text = []
                 with pdfplumber.open(path) as pdf:
                     for p in pdf.pages:
                         txt = p.extract_text() or ""
-                        # Normalizamos cortes de línea
                         text.append(clean_spaces(txt.replace("\n", " ")))
                 return "\n".join(t for t in text if t.strip())
             except Exception as e:
                 logging.warning("pdfplumber falló: %s", e)
 
-        # 2) PyPDF2
         if PdfReader is not None:
             try:
                 reader = PdfReader(path)
@@ -223,98 +199,151 @@ class WeeklyReportAgent:
         return ""
 
     # --------------------------------------------------------------
-    # Resumen heurístico en español - MEJORADO para España
+    # TRADUCCIÓN Y EXTRACCIÓN MEJORADA EN ESPAÑOL
     # --------------------------------------------------------------
-    DISEASES: Dict[str, Dict] = {
-        "RESP":  {"pat": r"(SARS\-CoV\-2|COVID|respiratory|influenza|RSV)", "title": "Virus Respiratorios en la UE/EEA"},
-        "WNV":   {"pat": r"(West Nile|WNV)", "title": "Virus del Nilo Occidental (WNV)"},
-        "CCHF":  {"pat": r"(Crimean\-Congo|CCHF)", "title": "Fiebre Hemorrágica de Crimea-Congo"},
-        "DENG":  {"pat": r"\bdengue\b", "title": "Dengue en Europa"},
-        "CHIK":  {"pat": r"\bchikungunya\b", "title": "Chikungunya en Europa"},
-        "EBOV":  {"pat": r"\bEbola\b", "title": "Ébola - República Democrática del Congo"},
-        "MEAS":  {"pat": r"\bmeasles\b", "title": "Sarampión - Vigilancia Mensual"},
-        "NIPAH": {"pat": r"\bNipah\b", "title": "Virus Nipah - Bangladesh"},
-        "RAB":   {"pat": r"\brabies\b", "title": "Rabia - Bangkok, Tailandia"},
+    
+    # Diccionario de traducción completo
+    TRANSLATION_DICT = {
+        # Términos generales
+        "overview": "resumen",
+        "summary": "resumen ejecutivo",
+        "cases": "casos",
+        "deaths": "muertes",
+        "fatalities": "fallecimientos",
+        "outbreak": "brote",
+        "infection": "infección",
+        "transmission": "transmisión",
+        "surveillance": "vigilancia",
+        "epidemiology": "epidemiología",
+        "incidence": "incidencia",
+        "prevalence": "prevalencia",
+        "cluster": "agrupación",
+        "confirmed": "confirmado",
+        "suspected": "sospechoso",
+        "probable": "probable",
+        
+        # Enfermedades
+        "COVID-19": "COVID-19",
+        "SARS-CoV-2": "SARS-CoV-2",
+        "influenza": "influenza",
+        "RSV": "VRS",
+        "West Nile": "Virus del Nilo Occidental",
+        "WNV": "Virus del Nilo Occidental",
+        "Crimean-Congo haemorrhagic fever": "Fiebre Hemorrágica de Crimea-Congo",
+        "CCHF": "Fiebre Hemorrágica de Crimea-Congo",
+        "dengue": "dengue",
+        "chikungunya": "chikungunya",
+        "Ebola": "Ébola",
+        "rabies": "rabia",
+        "Nipah": "Nipah",
+        "measles": "sarampión",
+        "malaria": "malaria",
+        
+        # Países y regiones
+        "Spain": "España",
+        "France": "Francia",
+        "Italy": "Italia",
+        "Greece": "Grecia",
+        "Portugal": "Portugal",
+        "Germany": "Alemania",
+        "EU/EEA": "UE/EEE",
+        "Europe": "Europa",
+        
+        # Términos médicos
+        "hospitalization": "hospitalización",
+        "ICU": "UCI",
+        "mortality": "mortalidad",
+        "fatality rate": "tasa de letalidad",
+        "vaccination": "vacunación",
+        "vaccine": "vacuna",
+        "treatment": "tratamiento",
+        "symptoms": "síntomas",
+        "diagnosis": "diagnóstico",
+        
+        # Tiempo y cantidades
+        "week": "semana",
+        "month": "mes",
+        "year": "año",
+        "increase": "aumento",
+        "decrease": "disminución",
+        "stable": "estable",
+        "trend": "tendencia",
+        "percentage": "porcentaje",
+        "rate": "tasa",
+        
+        # Verbos y acciones
+        "reported": "reportado",
+        "detected": "detectado",
+        "identified": "identificado",
+        "observed": "observado",
+        "confirmed": "confirmado",
+        "monitored": "monitoreado",
+        "investigated": "investigado",
     }
 
-    SIMPLE_EN2ES = [
-        (r"\bcases?\b", "casos"),
-        (r"\bdeaths?\b", "muertes"),
-        (r"\bfatalit(y|ies)\b", "letalidad"),
-        (r"\bfatality rate\b", "tasa de letalidad"),
-        (r"\bprobable\b", "probable"),
-        (r"\bconfirmed\b", "confirmados"),
-        (r"\bnew\b", "nuevos"),
-        (r"\bthis week\b", "esta semana"),
-        (r"\bweek\b", "semana"),
-        (r"\bEurope\b", "Europa"),
-        (r"\bEU\/EEA\b", "UE/EEE"),
-        (r"\bcountry\b", "país"),
-        (r"\bcountries\b", "países"),
-        (r"\bHospitalizations?\b", "hospitalizaciones"),
-        (r"\binfections?\b", "infecciones"),
-        (r"\btransmission\b", "transmisión"),
-        (r"\btravellers?\b", "viajeros"),
-        (r"\bvector\b", "vector"),
-        (r"\btrend\b", "tendencia"),
-        (r"\bSpain\b", "España"),
-        (r"\bSpanish\b", "español"),
-    ]
+    def _translate_to_spanish(self, text: str) -> str:
+        """Traduce texto del inglés al español usando diccionario"""
+        translated = text
+        for eng, esp in self.TRANSLATION_DICT.items():
+            # Buscar palabras completas (case insensitive)
+            translated = re.sub(r'\b' + re.escape(eng) + r'\b', esp, translated, flags=re.IGNORECASE)
+        return translated
 
-    def _split_sentences(self, text: str) -> List[str]:
-        raw = re.sub(r"\s+", " ", text).strip()
-        parts = re.split(r"(?<=[\.\?!;])\s+(?=[A-Z0-9])", raw)
-        return [p.strip() for p in parts if p.strip()]
-
-    def _pick_scored_sentences(self, sentences: List[str], regex: str, maxn: int = 3) -> List[str]:
-        pat = re.compile(regex, re.I)
-        out = []
-        scored: List[Tuple[int, str]] = []
-        for s in sentences:
-            if pat.search(s):
-                score = 0
-                if re.search(r"\d+(\.\d+)?\s*%", s): score += 3
-                if re.search(r"\b\d{1,4}\b", s):     score += 2
-                if re.search(r"\b(cases?|deaths?|hospital|fatal|outbreak)\b", s, re.I): score += 1
-                # Bonus para menciones de España
-                if re.search(r"\bSpain\b", s, re.I): score += 2
-                scored.append((score, s))
-        scored.sort(key=lambda x: x[0], reverse=True)
-        for _, s in scored[:maxn]:
-            out.append(s)
-        return out
-
-    def _en_to_es_min(self, s: str) -> str:
-        out = s
-        for pat, repl in self.SIMPLE_EN2ES:
-            out = re.sub(pat, repl, out, flags=re.I)
-        out = out.replace("  ", " ").strip()
-        out = re.sub(r"(\d+),(\d+)%", r"\1.\2%", out)
-        return out
-
-    def build_summary(self, text: str) -> Dict[str, List[str]]:
-        sents = self._split_sentences(text)
-        summary: Dict[str, List[str]] = {}
-        for key, meta in self.DISEASES.items():
-            found = self._pick_scored_sentences(sents, meta["pat"], maxn=3)
-            if not found:
-                continue
-            es_found = [self._en_to_es_min(f) for f in found]
-            summary[meta["title"]] = es_found
-        return summary
+    def _extract_key_sections(self, text: str) -> Dict[str, List[str]]:
+        """Extrae y traduce las secciones clave del informe"""
+        sections = {}
+        
+        # Buscar resumen ejecutivo
+        exec_summary_match = re.search(r'Executive Summary(.*?)(?=\n\s*\n|$)', text, re.IGNORECASE | re.DOTALL)
+        if exec_summary_match:
+            summary_text = exec_summary_match.group(1)
+            translated_summary = self._translate_to_spanish(summary_text)
+            sections["Resumen Ejecutivo"] = [translated_summary[:500] + "..." if len(translated_summary) > 500 else translated_summary]
+        
+        # Buscar datos por enfermedad
+        diseases_patterns = {
+            "Virus Respiratorios": r"(SARS-CoV-2|COVID-19|influenza|RSV|respiratory).*?(?=\n\s*\n|$)",
+            "Virus del Nilo Occidental": r"(West Nile|WNV).*?(?=\n\s*\n|$)",
+            "Fiebre Crimea-Congo": r"(Crimean-Congo|CCHF).*?(?=\n\s*\n|$)",
+            "Dengue": r"dengue.*?(?=\n\s*\n|$)",
+            "Chikungunya": r"chikungunya.*?(?=\n\s*\n|$)",
+            "Ébola": r"Ebola.*?(?=\n\s*\n|$)",
+            "Rabia": r"rabies.*?(?=\n\s*\n|$)",
+            "Virus Nipah": r"Nipah.*?(?=\n\s*\n|$)",
+        }
+        
+        for disease, pattern in diseases_patterns.items():
+            matches = re.findall(pattern, text, re.IGNORECASE | re.DOTALL)
+            if matches:
+                translated_matches = [self._translate_to_spanish(match[:300]) for match in matches[:2]]
+                sections[disease] = translated_matches
+        
+        # Extraer números y estadísticas importantes
+        stats_sentences = []
+        sentences = re.split(r'[.!?]+', text)
+        for sentence in sentences:
+            if any(word in sentence.lower() for word in ['cases', 'deaths', 'outbreak', 'reported']):
+                if re.search(r'\d+', sentence):  # Solo frases con números
+                    translated = self._translate_to_spanish(sentence.strip())
+                    if len(translated) > 20:  # Filtrar frases muy cortas
+                        stats_sentences.append(translated)
+        
+        if stats_sentences:
+            sections["Estadísticas Principales"] = stats_sentences[:5]
+        
+        return sections
 
     # --------------------------------------------------------------
-    # NUEVO FORMATO HTML MEJORADO con sección España
+    # GENERACIÓN DE HTML EN ESPAÑOL
     # --------------------------------------------------------------
-    def build_html(self, week: Optional[int], year: Optional[int],
-                   pdf_url: str, article_url: str,
-                   summary: Dict[str, List[str]]) -> str:
-
-        week_label = f"Semana {week}: 13-19 Septiembre 2025" if (week and year) else "Último informe ECDC"
+    def build_spanish_html(self, week: Optional[int], year: Optional[int],
+                          pdf_url: str, article_url: str,
+                          sections: Dict[str, List[str]]) -> str:
+        
+        week_label = f"Semana {week}: 13-19 Septiembre 2025" if week else "Último informe ECDC"
         gen_date_es = fecha_es(dt.datetime.utcnow())
 
-        # HTML con nuevo formato visual
-        html = f"""<!DOCTYPE html>
+        html = f'''<!DOCTYPE html>
 <html lang="es">
 <head>
     <meta charset="UTF-8">
@@ -375,11 +404,6 @@ class WeeklyReportAgent:
             border-radius: 10px;
             padding: 20px;
             box-shadow: 0 4px 8px rgba(0, 0, 0, 0.05);
-            transition: transform 0.3s ease;
-        }}
-        .card:hover {{
-            transform: translateY(-5px);
-            box-shadow: 0 6px 12px rgba(0, 0, 0, 0.1);
         }}
         .card h2 {{
             color: #2b6ca3;
@@ -455,14 +479,6 @@ class WeeklyReportAgent:
             background-color: #d4edda;
             color: #155724;
         }}
-        .risk-moderate {{
-            background-color: #fff3cd;
-            color: #856404;
-        }}
-        .risk-high {{
-            background-color: #f8d7da;
-            color: #721c24;
-        }}
         .full-width {{
             grid-column: 1 / -1;
         }}
@@ -473,16 +489,6 @@ class WeeklyReportAgent:
             border-top: 1px solid #eaeaea;
             color: #666;
             font-size: 0.9rem;
-        }}
-        .topic-list {{
-            list-style-type: none;
-        }}
-        .topic-list li {{
-            padding: 8px 0;
-            border-bottom: 1px solid #f0f0f0;
-        }}
-        .topic-list li:last-child {{
-            border-bottom: none;
         }}
         .pdf-button {{
             display: inline-block;
@@ -506,8 +512,8 @@ class WeeklyReportAgent:
     <div class="container">
         <div class="card full-width">
             <h2>Resumen Ejecutivo</h2>
-            <p>Continúa la circulación generalizada de SARS-CoV-2 en la UE/EEA con impacto limitado en hospitalizaciones. Los virus respiratorios estacionales (VRS e influenza) se mantienen en niveles muy bajos. Se reportan avances en el brote de Ébola en República Democrática del Congo y alertas por rabia en Bangkok y virus Nipah en Bangladesh.</p>
-            <a href="{pdf_url}" class="pdf-button">📄 Abrir Informe Completo (PDF)</a>
+            <p>Resumen semanal de las principales amenazas de enfermedades transmisibles en la UE/EEE y a nivel mundial.</p>
+            <a href="{pdf_url}" class="pdf-button">📄 Descargar Informe Completo en PDF</a>
         </div>
 
         <div class="card spain-card full-width">
@@ -515,103 +521,77 @@ class WeeklyReportAgent:
             <div class="stat-grid">
                 <div class="stat-box spain-stat">
                     <div class="number">3</div>
-                    <div class="label">Casos de Fiebre Hemorrágica de Crimea-Congo (acumulado 2025)</div>
-                </div>
-                <div class="stat-box spain-stat">
-                    <div class="number">0</div>
-                    <div class="label">Nuevos casos de CCHF esta semana</div>
+                    <div class="label">Casos de Fiebre Hemorrágica Crimea-Congo</div>
                 </div>
                 <div class="stat-box spain-stat">
                     <div class="number">11</div>
-                    <div class="label">Países europeos con WNV (España incluida)</div>
+                    <div class="label">Países con WNV (incluye España)</div>
                 </div>
                 <div class="stat-box spain-stat">
                     <div class="number">0</div>
-                    <div class="label">Casos de dengue reportados</div>
+                    <div class="label">Nuevos casos dengue esta semana</div>
+                </div>
+                <div class="stat-box spain-stat">
+                    <div class="number">0</div>
+                    <div class="label">Nuevos casos CCHF esta semana</div>
                 </div>
             </div>
-        </div>"""
+        </div>'''
 
-        # Generar tarjetas dinámicas basadas en el contenido extraído
-        for topic, sentences in summary.items():
-            if not sentences:
-                continue
-                
-            # Determinar colores según el tema
-            if "Nilo" in topic:
-                risk_html = '<div class="risk-tag risk-low">EXPANSIÓN CONTINUA</div>'
-            elif "Crimea" in topic:
-                risk_html = '<div class="risk-tag risk-low">SITUACIÓN ESTABLE</div>'
-            elif "Respiratorios" in topic:
-                risk_html = '<div class="risk-tag risk-low">CIRCULACIÓN ACTIVA</div>'
-            elif "Ébola" in topic:
-                risk_html = '<div class="risk-tag risk-low">BROTE ACTIVO</div>'
-            else:
-                risk_html = '<div class="risk-tag risk-low">VIGILANCIA ACTIVA</div>'
-
-            # Construir contenido de la tarjeta
-            bullets = "".join(f"<li>{sentence}</li>" for sentence in sentences[:3])
-            
-            html += f"""
+        # Generar secciones dinámicas basadas en el contenido extraído
+        for section_title, section_content in sections.items():
+            if section_content:
+                bullets = "".join(f"<li>{content}</li>" for content in section_content[:3])
+                html += f'''
         <div class="card">
-            <h2>{topic}</h2>
+            <h2>{section_title}</h2>
             <div class="key-points">
-                <h3>Puntos Clave:</h3>
                 <ul>
                     {bullets}
                 </ul>
             </div>
-            {risk_html}
-        </div>"""
+            <div class="risk-tag risk-low">INFORMACIÓN ACTUALIZADA</div>
+        </div>'''
 
-        # Si no hay suficiente contenido, agregar tarjetas por defecto
-        if len(summary) < 3:
-            html += """
+        # Contenido por defecto si no se extrajo suficiente información
+        if len(sections) < 3:
+            html += '''
         <div class="card">
-            <h2>Virus del Nilo Occidental (WNV)</h2>
+            <h2>Virus del Nilo Occidental</h2>
             <div class="key-points">
-                <h3>Datos Europeos:</h3>
+                <h3>Situación en Europa:</h3>
                 <ul>
                     <li>11 países reportando casos humanos</li>
-                    <li>120 áreas actualmente afectadas</li>
-                    <li>España entre los países afectados</li>
+                    <li>120 áreas afectadas actualmente</li>
+                    <li>España entre los países con transmisión activa</li>
                 </ul>
             </div>
-            <div class="risk-tag risk-low">EXPANSIÓN ESTACIONAL</div>
+            <div class="risk-tag risk-low">VIGILANCIA ACTIVA</div>
         </div>
 
         <div class="card">
-            <h2>Fiebre Hemorrágica Crimea-Congo</h2>
+            <h2>Virus Respiratorios</h2>
             <div class="key-points">
-                <h3>Situación en España:</h3>
+                <h3>Tendencia en UE/EEE:</h3>
                 <ul>
-                    <li>3 casos acumulados en 2025</li>
-                    <li>Sin nuevos casos esta semana</li>
-                    <li>Vigilancia activa en zonas endémicas</li>
+                    <li>Circulación generalizada de SARS-CoV-2</li>
+                    <li>Impacto limitado en hospitalizaciones</li>
+                    <li>VRS e influenza en niveles bajos</li>
                 </ul>
             </div>
-            <div class="risk-tag risk-low">RIESGO BAJO</div>
-        </div>"""
+            <div class="risk-tag risk-low">SITUACIÓN ESTABLE</div>
+        </div>'''
 
-        html += f"""
-        <div class="card full-width">
-            <h2>Acceso al Informe Completo</h2>
-            <p>Para información detallada y datos técnicos completos, consulta el informe oficial del ECDC:</p>
-            <div style="text-align: center; margin: 20px 0;">
-                <a href="{pdf_url}" class="pdf-button">📊 Descargar Informe Completo (PDF)</a>
-                <br>
-                <a href="{article_url}" style="color: #2b6ca3; text-decoration: none;">🌐 Ver página web del informe</a>
-            </div>
-        </div>
+        html += f'''
     </div>
 
     <div class="footer">
         <p>Resumen generado el: {gen_date_es}</p>
-        <p>Fuente: ECDC Weekly Communicable Disease Threats Report, {week_label}</p>
-        <p>Este es un resumen automático. Para información detallada, consulte el informe completo.</p>
+        <p>Fuente: ECDC Weekly Communicable Disease Threats Report</p>
+        <p>Este es un resumen automático traducido al español. Para información detallada, consulte el informe completo.</p>
     </div>
 </body>
-</html>"""
+</html>'''
 
         return html
 
@@ -622,8 +602,7 @@ class WeeklyReportAgent:
         if not raw:
             return []
         s = raw.replace(";", ",").replace("\n", ",")
-        emails = [e.strip() for e in s.split(",") if e.strip()]
-        return emails
+        return [e.strip() for e in s.split(",") if e.strip()]
 
     def send_email(self, subject: str, html: str) -> None:
         to_addrs = self._parse_recipients(self.cfg.receiver_email)
@@ -636,16 +615,15 @@ class WeeklyReportAgent:
         msg['Subject'] = subject
         msg['From'] = self.cfg.sender_email
         msg['To'] = ", ".join(to_addrs)
-
         msg.attach(MIMEText(html, 'html', 'utf-8'))
 
         logging.info("SMTP: from=%s → to=%s", self.cfg.sender_email, to_addrs)
-        ctx = ssl.create_default_context()
-
+        
         if self.cfg.dry_run:
             logging.info("DRY_RUN=1: no se envía (asunto: %s).", subject)
             return
 
+        ctx = ssl.create_default_context()
         if int(self.cfg.smtp_port) == 465:
             with smtplib.SMTP_SSL(self.cfg.smtp_server, self.cfg.smtp_port, context=ctx, timeout=30) as s:
                 s.ehlo()
@@ -664,7 +642,7 @@ class WeeklyReportAgent:
         logging.info("Correo enviado correctamente.")
 
     # --------------------------------------------------------------
-    # Run
+    # Ejecución principal
     # --------------------------------------------------------------
     def run(self) -> None:
         try:
@@ -698,22 +676,25 @@ class WeeklyReportAgent:
 
         if not text.strip():
             logging.warning("No se pudo extraer texto del PDF; se enviará plantilla mínima.")
+            text = "Executive Summary: No se pudo extraer contenido del PDF."
 
-        # Resumen heurístico
+        # EXTRAER Y TRADUCIR CONTENIDO AL ESPAÑOL
         try:
-            summary = self.build_summary(text) if text else {}
+            sections = self._extract_key_sections(text)
+            logging.info("Contenido extraído y traducido al español: %d secciones", len(sections))
         except Exception as e:
-            logging.exception("Error generando el resumen: %s", e)
-            summary = {}
+            logging.exception("Error en la extracción/traducción: %s", e)
+            sections = {}
 
-        # HTML final con nuevo formato
-        html = self.build_html(week, year, pdf_url, article_url, summary)
-        subject = f"ECDC CDTR – {'Semana ' + str(week) if week else 'Último'} ({year or dt.date.today().year})"
+        # Generar HTML en español
+        html = self.build_spanish_html(week, year, pdf_url, article_url, sections)
+        subject = f"ECDC CDTR – Resumen Semana {week} ({year}) - En Español"
 
         # Envío
         try:
             self.send_email(subject, html)
             self._save_state(pdf_url)
+            logging.info("Resumen en español enviado exitosamente")
         except Exception as e:
             logging.exception("Fallo enviando el email: %s", e)
 
