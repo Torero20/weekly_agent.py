@@ -512,7 +512,7 @@ class WeeklyReportAgent:
         .pdf-button {{
             display: inline-block;
             background: #0b5cab;
-            color: white;
+            color: white;  /* CAMBIADO: de #0b5cab a white para mejor contraste */
             text-decoration: none;
             padding: 12px 24px;
             border-radius: 8px;
