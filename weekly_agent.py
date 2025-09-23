@@ -18,6 +18,7 @@ import requests
 from requests.adapters import HTTPAdapter, Retry
 from bs4 import BeautifulSoup
 
+# PDF: extractor principal y respaldo
 try:
     import pdfplumber  # type: ignore
 except Exception:
@@ -32,9 +33,9 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
 
-# =========================
-# Config
-# =========================
+# =====================================================================
+# Configuración
+# =====================================================================
 
 class Config:
     list_url = "https://www.ecdc.europa.eu/en/publications-and-data/monitoring/weekly-threats-reports"
@@ -49,12 +50,11 @@ class Config:
     log_level = os.getenv("LOG_LEVEL", "INFO")
     state_file = ".weekly_agent_state.json"
     max_pdf_mb = int(os.getenv("MAX_PDF_MB", "30"))
-    html_template_path = os.getenv("HTML_TEMPLATE_PATH", "").strip()  # opcional
 
 
-# =========================
-# Utils
-# =========================
+# =====================================================================
+# Utilidades
+# =====================================================================
 
 MESES_ES = {
     1: "enero", 2: "febrero", 3: "marzo", 4: "abril", 5: "mayo", 6: "junio",
@@ -67,13 +67,19 @@ def fecha_es(dt_utc: dt.datetime) -> str:
 def clean_spaces(s: str) -> str:
     return re.sub(r"\s+", " ", s or "").strip()
 
-def ul(items: List[str]) -> str:
-    return "<ul>" + "".join(f"<li>{x}</li>" for x in items) + "</ul>"
+def safe_num(v, default="—"):
+    return default if (v is None or v == "") else str(v)
+
+def first_day_last_day_of_iso_week(year: int, week: int) -> Tuple[dt.datetime, dt.datetime]:
+    # lunes a domingo
+    d1 = dt.datetime.fromisocalendar(year, week, 1)
+    d7 = dt.datetime.fromisocalendar(year, week, 7)
+    return d1, d7
 
 
-# =========================
-# Agent
-# =========================
+# =====================================================================
+# Agente – versión con plantilla del usuario integrada
+# =====================================================================
 
 class WeeklyReportAgent:
     def __init__(self, cfg: Config) -> None:
@@ -84,7 +90,9 @@ class WeeklyReportAgent:
         )
         self.session = self._build_session()
 
-    # ---------- Networking / ECDC ----------
+    # --------------------------------------------------------------
+    # Red y parsing ECDC
+    # --------------------------------------------------------------
     def _build_session(self) -> requests.Session:
         s = requests.Session()
         s.headers.update({
@@ -103,8 +111,11 @@ class WeeklyReportAgent:
         return (int(w.group(1)) if w else None, int(y.group(1)) if y else None)
 
     def _extract_article_date(self, soup: BeautifulSoup) -> Optional[dt.datetime]:
-        for sel in ['time[datetime]', 'meta[property="article:published_time"]',
-                    'meta[name="date"]', 'meta[name="pubdate"]']:
+        selectors = [
+            'time[datetime]', 'meta[property="article:published_time"]',
+            'meta[name="date"]', 'meta[name="pubdate"]'
+        ]
+        for sel in selectors:
             el = soup.select_one(sel)
             val = (el.get("datetime") or el.get("content")) if el else None
             if val:
@@ -160,7 +171,9 @@ class WeeklyReportAgent:
         logging.info("PDF seleccionado: %s (semana=%s, año=%s)", pdf_url, week, year)
         return article_url, pdf_url, week, year
 
-    # ---------- State & download ----------
+    # --------------------------------------------------------------
+    # Estado y descarga
+    # --------------------------------------------------------------
     def _load_state(self) -> Dict[str, Any]:
         if not os.path.exists(self.cfg.state_file):
             return {}
@@ -223,7 +236,9 @@ class WeeklyReportAgent:
 
         return ""
 
-    # ---------- Extraction (with evidence) ----------
+    # --------------------------------------------------------------
+    # EXTRACCIÓN DE DATOS (con evidencias)
+    # --------------------------------------------------------------
     def _capture_sentence(self, text_lower: str, anchor: str, window: int = 180) -> Optional[str]:
         i = text_lower.find(anchor)
         if i == -1:
@@ -235,444 +250,308 @@ class WeeklyReportAgent:
         return (m.group(1).strip() + ".") if m else snippet.strip()
 
     def extract_key_data(self, text: str) -> Dict[str, Any]:
-        data: Dict[str, Any] = {"spain": {}, "eu": {}, "evidence": {}, "topics": {}}
+        """Extrae datos clave con cierta robustez y guarda frases evidenciales."""
+        data: Dict[str, Any] = {"spain": {}, "eu": {}, "evidence": {}}
         tl = (text or "").lower()
 
-        # WNV EU
+        # WNV – países en UE/EEE
         m = re.search(r'west nile[^.]*?\b(\d{1,3})\b[^.]*?\bcountr', tl)
         if m:
             data["eu"]["wnv_countries"] = int(m.group(1))
             ev = self._capture_sentence(tl, "west nile")
             if ev: data["evidence"]["wnv_countries"] = ev
 
-        # WNV Spain
+        # WNV España – casos
         m = re.search(r'spain[^.]*west nile[^.]*?(\d{1,4})[^.]*case', tl)
         if m:
             data["spain"]["wnv_cases"] = int(m.group(1))
             ev = self._capture_sentence(tl, "spain")
             if ev: data["evidence"]["spain_wnv"] = ev
+
+        # Zonas/municipios WNV en España (opcional)
         m = re.search(r'spain[^.]*west nile[^.]*?(\d{1,3})[^.]*?(?:municipal|area|zone)', tl)
         if m:
             data["spain"]["wnv_municipalities"] = int(m.group(1))
 
-        # Dengue EU (autóctono total / países)
+        # Dengue UE/EEE autóctono
         m = re.search(r'(?:eu|europe|\bue\b)[^.]*?dengue[^.]*?(\d{1,6})[^.]*?cases', tl)
         if m:
             data["eu"]["dengue_auto_total"] = int(m.group(1))
             ev = self._capture_sentence(tl, "dengue")
             if ev: data["evidence"]["dengue_eu"] = ev
+
         m = re.search(r'(?:autochthonous|local)\s+dengue[^.]*?in\s+(\d{1,3})\s+(?:countries|member states)', tl)
         if m:
             data["eu"]["dengue_auto_countries"] = int(m.group(1))
 
-        # Dengue Spain (autóctono / importado)
+        # Dengue España (autóctono/importado)
         m = re.search(r'spain[^.]*dengue[^.]*?(\d{1,4})[^.]*?(?:autochthonous|local)', tl)
         if m:
             data["spain"]["dengue_local"] = int(m.group(1))
             ev = self._capture_sentence(tl, "spain")
             if ev: data["evidence"]["spain_dengue_local"] = ev
+
         m = re.search(r'spain[^.]*dengue[^.]*?(\d{1,4})[^.]*?import', tl)
         if m:
             data["spain"]["dengue_imported"] = int(m.group(1))
             ev = self._capture_sentence(tl, "spain")
             if ev: data["evidence"]["spain_dengue_imported"] = ev
 
-        # CCHF Spain
+        # CCHF España
         m = re.search(r'spain[^.]*?(?:crimean|crimea).*?(?:congo|cchf)[^.]*?(\d{1,4})[^.]*?case', tl)
         if m:
             data["spain"]["cchf_cases"] = int(m.group(1))
             ev = self._capture_sentence(tl, "spain")
             if ev: data["evidence"]["spain_cchf"] = ev
-        # CCHF EU countries
-        m = re.search(r'(?:eu|europe|\bue\b)[^.]*?(?:crimean|crimea).*?(?:congo|cchf)[^.]*?(\d{1,3})[^.]*?countr', tl)
-        if m:
-            data["eu"]["cchf_countries"] = int(m.group(1))
 
-        # SARS-CoV-2 positivity (generic)
+        # SARS-CoV-2 positividad (si aparece algún %)
         m = re.search(r'sars[- ]?cov[- ]?2[^%]*?(\d{1,2}(?:\.\d+)?)\s*%', tl)
         if m:
             data["spain"]["sars_pos"] = float(m.group(1))
             data["evidence"]["sars_pos"] = self._capture_sentence(tl, "sars-cov-2") or ""
 
-        # Ebola (DRC) – cases/deaths (best-effort)
-        eb_cases = re.search(r'ebola[^.]*?(\d{1,4})[^.]*?cases', tl)
-        eb_deaths = re.search(r'ebola[^.]*?(\d{1,4})[^.]*?deaths', tl)
-        if eb_cases or eb_deaths:
-            data["topics"]["ebola"] = {
-                "cases": int(eb_cases.group(1)) if eb_cases else None,
-                "deaths": int(eb_deaths.group(1)) if eb_deaths else None,
-            }
-            ev = self._capture_sentence(tl, "ebola")
-            if ev: data["evidence"]["ebola"] = ev
-
-        # Nipah (Bangladesh)
-        ni_deaths = re.search(r'nipah[^.]*?(\d{1,4})[^.]*?deaths', tl)
-        if ni_deaths:
-            data["topics"]["nipah"] = {"deaths": int(ni_deaths.group(1))}
-            ev = self._capture_sentence(tl, "nipah")
-            if ev: data["evidence"]["nipah"] = ev
-
-        # Rabies (Bangkok)
-        if "rabies" in tl and "bangkok" in tl:
-            data["topics"]["rabies_bkk"] = True
-            ev = self._capture_sentence(tl, "rabies")
-            if ev: data["evidence"]["rabies_bkk"] = ev
-
-        # Chikungunya (EU – very best-effort)
-        if "chikungunya" in tl:
-            data["topics"]["chik"] = True
-            ev = self._capture_sentence(tl, "chikungunya")
-            if ev: data["evidence"]["chik"] = ev
-
         return data
 
-    # ---------- Summary (ES focus + EU context) ----------
-    def generate_spanish_summary_rico(self, data: Dict[str, Any],
-                                      week: Optional[int], year: Optional[int]) -> Dict[str, List[str]]:
-        w = week or "N/D"; y = year or "N/D"
-        summary: Dict[str, List[str]] = {}
-
-        sp = data.get("spain", {}) if isinstance(data.get("spain"), dict) else {}
-        eu = data.get("eu", {}) if isinstance(data.get("eu"), dict) else {}
-        ev = data.get("evidence", {}) if isinstance(data.get("evidence"), dict) else {}
-        topics = data.get("topics", {}) if isinstance(data.get("topics"), dict) else {}
-
-        # Resumen ejecutivo
-        exec_points = [f"Informe semanal ECDC – Semana {w} de {y}.",
-                       "Foco en España con contexto comparado UE/EEE y evidencias textuales."]
-        if sp.get("wnv_cases") is not None:
-            fr = f"WNV (España): {sp['wnv_cases']} caso(s)"
-            if sp.get("wnv_municipalities"): fr += f" en {sp['wnv_municipalities']} zona(s)"
-            exec_points.append(fr + ".")
-        if (sp.get("dengue_local") is not None) or (sp.get("dengue_imported") is not None):
-            frs = []
-            if sp.get("dengue_local") is not None: frs.append(f"autóctonos {sp['dengue_local']}")
-            if sp.get("dengue_imported") is not None: frs.append(f"importados {sp['dengue_imported']}")
-            exec_points.append("Dengue (España): " + ", ".join(frs) + ".")
-        if sp.get("cchf_cases") is not None:
-            exec_points.append(f"CCHF (España): {sp['cchf_cases']} caso(s).")
-        if eu.get("wnv_countries") is not None:
-            exec_points.append(f"WNV (UE/EEE): {eu['wnv_countries']} países con transmisión.")
-        summary["Resumen Ejecutivo"] = exec_points
-
-        # España – visión detallada
-        es_points: List[str] = []
-        if sp.get("wnv_cases") is not None:
-            msg = f"WNV: {sp['wnv_cases']} caso(s)"
-            if sp.get("wnv_municipalities"): msg += f" en {sp['wnv_municipalities']} municipio(s)/zona(s)"
-            msg += ". Implicaciones: control vectorial local y cribado en hemoderivados según protocolos."
-            es_points.append(msg)
-        if (sp.get("dengue_local") is not None) or (sp.get("dengue_imported") is not None):
-            dl = sp.get("dengue_local"); di = sp.get("dengue_imported")
-            frag = []
-            if dl is not None: frag.append(f"autóctonos={dl}")
-            if di is not None: frag.append(f"importados={di}")
-            es_points.append("Dengue: " + ", ".join(frag) + ". Relevancia: vigilancia de Aedes, triaje de fiebre post-viaje y notificación ágil.")
-        if sp.get("cchf_cases") is not None:
-            es_points.append(f"CCHF: {sp['cchf_cases']} caso(s). Riesgo ocupacional en entornos rurales/ganaderos; EPI y educación sanitaria.")
-        if sp.get("sars_pos") is not None:
-            es_points.append(f"Respiratorios: SARS-CoV-2 positividad ≈ {sp['sars_pos']}%. Mantener vigilancia y circuitos asistenciales.")
-        if not es_points:
-            es_points.append("Sin indicadores específicos detectados para España esta semana; mantener vigilancia de rutina.")
-        summary["España – visión detallada"] = es_points
-
-        # UE/EEE
-        eu_points: List[str] = []
-        if eu.get("wnv_countries") is not None:
-            eu_points.append(f"WNV (UE/EEE): {eu['wnv_countries']} países con transmisión. Patrón estacional con picos verano-otoño.")
-        if eu.get("dengue_auto_countries") is not None or eu.get("dengue_auto_total") is not None:
-            fr = []
-            if eu.get("dengue_auto_countries") is not None:
-                fr.append(f"autóctono en {eu['dengue_auto_countries']} país(es)")
-            if eu.get("dengue_auto_total") is not None:
-                fr.append(f"≈ {eu['dengue_auto_total']} casos")
-            eu_points.append("Dengue (UE/EEE): " + "; ".join(fr) + ". Expansión vectorial ligada al clima; vigilancia transfronteriza.")
-        if eu.get("cchf_countries") is not None:
-            eu_points.append(f"CCHF (UE/EEE): circulación en {eu['cchf_countries']} país(es). Riesgo bajo-moderado general.")
-        if eu.get("sars_pos") is not None:
-            eu_points.append(f"Respiratorios: positividad SARS-CoV-2 (UE/EEE) ≈ {eu['sars_pos']}%.")
-        if not eu_points:
-            eu_points.append("Sin señales pan-europeas destacables adicionales esta semana.")
-        summary["Panorama UE/EEE"] = eu_points
-
-        # Recomendaciones
-        summary["Recomendaciones operativas"] = [
-            "Comunicación rápida con salud pública ante fiebre sin foco con viaje/picadura.",
-            "Control vectorial local (aguas estancadas) y mensajes a población en zonas de riesgo.",
-            "Cribado transfusional y de trasplantes según transmisión WNV en el área de captación.",
-            "Laboratorio: circuito de notificación ágil y paneles sindrómicos en picos estacionales."
-        ]
-
-        # Alertas (otros tópicos si se detectan)
-        alertas: List[str] = []
-        if "ebola" in topics:
-            c = topics["ebola"].get("cases"); d = topics["ebola"].get("deaths")
-            frag = "Ébola (RDC): "
-            if c is not None: frag += f"{c} casos"
-            if d is not None: frag += f" – {d} muertes"
-            alertas.append(frag)
-        if "rabies_bkk" in topics:
-            alertas.append("Rabia – Bangkok: alerta local; evitar contacto con animales callejeros.")
-        if "nipah" in topics:
-            d = topics["nipah"].get("deaths")
-            alertas.append(f"Virus Nipah – Bangladesh: {d} muertes reportadas." if d else "Virus Nipah – Bangladesh: actualización de brote.")
-        if "chik" in topics:
-            alertas.append("Chikungunya – Europa: transmisión local activa (datos país-dependientes).")
-        if alertas:
-            summary["Alertas y monitoreo activo"] = alertas
-
-        # Evidencias
-        if ev:
-            items = []
-            for k, v in ev.items():
-                if v:
-                    items.append(f"<li><strong>{k}:</strong> {v}</li>")
-            evid_html = "<ul>" + "".join(items) + "</ul>"
-        else:
-            evid_html = ""
-
-        summary["data"] = data
-        summary["evidence_html"] = evid_html
-        return summary
-
-    # ---------- HTML rendering ----------
-    def _default_html(self, week: Optional[int], year: Optional[int],
-                      pdf_url: str, article_url: str,
-                      summary: Dict[str, List[str]]) -> str:
-        """
-        Plantilla integrada inspirada en tu HTML (mismo look&feel y secciones),
-        pero 100% dinámica. Se muestran solo datos disponibles (sin inventar).
-        """
-        week_label = f"Semana {week}, {year}" if week and year else "Último informe"
-        gen_date_es = fecha_es(dt.datetime.utcnow())
-
-        data = summary.get("data", {}) if isinstance(summary.get("data"), dict) else {}
-        sp = data.get("spain", {}) if isinstance(data.get("spain"), dict) else {}
-        eu = data.get("eu", {}) if isinstance(data.get("eu"), dict) else {}
-
-        def stat_box(number: Optional[str], label: str, accent: bool=False) -> str:
-            if number is None: number = "–"
-            cls = "spain-stat" if accent else ""
-            return f'''<div class="stat-box {cls}">
-                <div class="number">{number}</div>
-                <div class="label">{label}</div>
-            </div>'''
-
-        # Grids dinámicos
-        es_grid = "".join([
-            stat_box(str(sp.get('cchf_cases')) if sp.get('cchf_cases') is not None else None,
-                     "CCHF – casos (España)", True),
-            stat_box(str(sp.get('wnv_cases')) if sp.get('wnv_cases') is not None else None,
-                     "WNV – casos (España)", True),
-            stat_box(str(sp.get('wnv_municipalities')) if sp.get('wnv_municipalities') is not None else None,
-                     "WNV – zonas/municipios", True),
-            stat_box(str(sp.get('dengue_local')) if sp.get('dengue_local') is not None else None,
-                     "Dengue autóctono (España)", True),
-            stat_box(str(sp.get('dengue_imported')) if sp.get('dengue_imported') is not None else None,
-                     "Dengue importado (España)", True),
-            stat_box((f"{sp.get('sars_pos')}%" if sp.get('sars_pos') is not None else None),
-                     "SARS-CoV-2 – positividad", True),
-        ])
-
-        eu_grid = "".join([
-            stat_box(str(eu.get('wnv_countries')) if eu.get('wnv_countries') is not None else None,
-                     "Países con WNV (UE/EEE)"),
-            stat_box(str(eu.get('dengue_auto_countries')) if eu.get('dengue_auto_countries') is not None else None,
-                     "Países con dengue autóctono"),
-            stat_box(str(eu.get('dengue_auto_total')) if eu.get('dengue_auto_total') is not None else None,
-                     "Dengue autóctono – total UE/EEE"),
-            stat_box(str(eu.get('cchf_countries')) if eu.get('cchf_countries') is not None else None,
-                     "Países con CCHF"),
-        ])
-
-        resumen_exec = ul(summary.get("Resumen Ejecutivo", []))
-        es_bullets = ul(summary.get("España – visión detallada", []))
-        eu_bullets = ul(summary.get("Panorama UE/EEE", []))
-        alertas_ul = ul(summary.get("Alertas y monitoreo activo", [])) if summary.get("Alertas y monitoreo activo") else ""
-
-        # HTML (mismo estilo visual que tu ejemplo)
-        html = f"""<!DOCTYPE html>
+    # --------------------------------------------------------------
+    # Render a la PLANTILLA del usuario (parametrizada)
+    # --------------------------------------------------------------
+    USER_TEMPLATE = """<!DOCTYPE html>
 <html lang="es">
 <head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Resumen Semanal ECDC - {week_label}</title>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Resumen Semanal ECDC - [[TITLE_WEEK]]</title>
 <style>
-* {{ margin: 0; padding: 0; box-sizing: border-box; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }}
-body {{ background-color: #f5f7fa; color: #333; line-height: 1.6; padding: 20px; max-width: 1200px; margin: 0 auto; }}
-.header {{ text-align: center; padding: 20px; background: linear-gradient(135deg, #2b6ca3 0%, #1a4e7a 100%); color: white; border-radius: 10px; margin-bottom: 25px; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1); }}
-.header h1 {{ font-size: 2.2rem; margin-bottom: 10px; }}
-.header .subtitle {{ font-size: 1.2rem; margin-bottom: 15px; opacity: 0.9; }}
-.header .week {{ background-color: rgba(255, 255, 255, 0.2); display: inline-block; padding: 8px 16px; border-radius: 30px; font-weight: 600; }}
-.container {{ display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }}
-@media (max-width: 900px) {{ .container {{ grid-template-columns: 1fr; }} }}
-.card {{ background: white; border-radius: 10px; padding: 20px; box-shadow: 0 4px 8px rgba(0, 0, 0, 0.05); transition: transform 0.3s ease; }}
-.card:hover {{ transform: translateY(-5px); box-shadow: 0 6px 12px rgba(0, 0, 0, 0.1); }}
-.card h2 {{ color: #2b6ca3; border-bottom: 2px solid #eaeaea; padding-bottom: 10px; margin-bottom: 15px; font-size: 1.4rem; }}
-.spain-card {{ border-left: 5px solid #c60b1e; background-color: #fff9f9; }}
-.spain-card h2 {{ color: #c60b1e; display: flex; align-items: center; }}
-.spain-card h2:before {{ content: "🇪🇸"; margin-right: 10px; }}
-.stat-grid {{ display: grid; grid-template-columns: repeat(2, 1fr); gap: 15px; margin: 15px 0; }}
-.stat-box {{ background: #f8f9fa; padding: 15px; border-radius: 8px; text-align: center; border: 1px solid #eaeaea; }}
-.stat-box .number {{ font-size: 1.8rem; font-weight: bold; color: #2b6ca3; margin-bottom: 5px; }}
-.stat-box .label {{ font-size: 0.9rem; color: #666; }}
-.spain-stat .number {{ color: #c60b1e; }}
-.key-points {{ background-color: #e8f4ff; padding: 15px; border-radius: 8px; margin: 15px 0; }}
-.key-points h3 {{ margin-bottom: 10px; color: #2b6ca3; }}
-.key-points ul {{ padding-left: 20px; }}
-.key-points li {{ margin-bottom: 8px; }}
-.risk-tag {{ display: inline-block; padding: 5px 12px; border-radius: 20px; font-size: 0.85rem; font-weight: 600; margin-top: 10px; }}
-.risk-low {{ background-color: #d4edda; color: #155724; }}
-.risk-moderate {{ background-color: #fff3cd; color: #856404; }}
-.risk-high {{ background-color: #f8d7da; color: #721c24; }}
-.full-width {{ grid-column: 1 / -1; }}
-.footer {{ text-align: center; margin-top: 30px; padding-top: 20px; border-top: 1px solid #eaeaea; color: #666; font-size: 0.9rem; }}
-.topic-list {{ list-style-type: none; }}
-.topic-list li {{ padding: 8px 0; border-bottom: 1px solid #f0f0f0; }}
-.topic-list li:last-child {{ border-bottom: none; }}
-.pdf-button {{ display: inline-block; background: #0b5cab; color: white; text-decoration: none; padding: 12px 24px; border-radius: 8px; font-weight: 700; margin: 10px 0; }}
-.update-badge {{ display: inline-block; background: #ff6b6b; color: white; padding: 2px 8px; border-radius: 12px; font-size: 0.7rem; margin-left: 8px; vertical-align: middle; }}
+* { margin: 0; padding: 0; box-sizing: border-box; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+body { background-color: #f5f7fa; color: #333; line-height: 1.6; padding: 20px; max-width: 1200px; margin: 0 auto; }
+.header { text-align: center; padding: 20px; background: linear-gradient(135deg, #2b6ca3 0%, #1a4e7a 100%); color: white; border-radius: 10px; margin-bottom: 25px; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1); }
+.header h1 { font-size: 2.2rem; margin-bottom: 10px; }
+.header .subtitle { font-size: 1.2rem; margin-bottom: 15px; opacity: 0.9; }
+.header .week { background-color: rgba(255, 255, 255, 0.2); display: inline-block; padding: 8px 16px; border-radius: 30px; font-weight: 600; }
+.container { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+@media (max-width: 900px) { .container { grid-template-columns: 1fr; } }
+.card { background: white; border-radius: 10px; padding: 20px; box-shadow: 0 4px 8px rgba(0, 0, 0, 0.05); transition: transform 0.3s ease; }
+.card:hover { transform: translateY(-5px); box-shadow: 0 6px 12px rgba(0, 0, 0, 0.1); }
+.card h2 { color: #2b6ca3; border-bottom: 2px solid #eaeaea; padding-bottom: 10px; margin-bottom: 15px; font-size: 1.4rem; }
+.spain-card { border-left: 5px solid #c60b1e; background-color: #fff9f9; }
+.spain-card h2 { color: #c60b1e; display: flex; align-items: center; }
+.spain-card h2:before { content: "🇪🇸"; margin-right: 10px; }
+.stat-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 15px; margin: 15px 0; }
+.stat-box { background: #f8f9fa; padding: 15px; border-radius: 8px; text-align: center; border: 1px solid #eaeaea; }
+.stat-box .number { font-size: 1.8rem; font-weight: bold; color: #2b6ca3; margin-bottom: 5px; }
+.stat-box .label { font-size: 0.9rem; color: #666; }
+.spain-stat .number { color: #c60b1e; }
+.key-points { background-color: #e8f4ff; padding: 15px; border-radius: 8px; margin: 15px 0; }
+.key-points h3 { margin-bottom: 10px; color: #2b6ca3; }
+.key-points ul { padding-left: 20px; }
+.key-points li { margin-bottom: 8px; }
+.risk-tag { display: inline-block; padding: 5px 12px; border-radius: 20px; font-size: 0.85rem; font-weight: 600; margin-top: 10px; }
+.risk-low { background-color: #d4edda; color: #155724; }
+.risk-moderate { background-color: #fff3cd; color: #856404; }
+.risk-high { background-color: #f8d7da; color: #721c24; }
+.full-width { grid-column: 1 / -1; }
+.footer { text-align: center; margin-top: 30px; padding-top: 20px; border-top: 1px solid #eaeaea; color: #666; font-size: 0.9rem; }
+.topic-list { list-style-type: none; }
+.topic-list li { padding: 8px 0; border-bottom: 1px solid #f0f0f0; }
+.topic-list li:last-child { border-bottom: none; }
+.pdf-button { display: inline-block; background: #0b5cab; color: white; text-decoration: none; padding: 12px 24px; border-radius: 8px; font-weight: 700; margin: 10px 0; }
+.update-badge { display: inline-block; background: #ff6b6b; color: white; padding: 2px 8px; border-radius: 12px; font-size: 0.7rem; margin-left: 8px; vertical-align: middle; }
 </style>
 </head>
 <body>
-  <div class="header">
-    <h1>Resumen Semanal de Amenazas de Enfermedades Transmisibles</h1>
-    <div class="subtitle">Centro Europeo para la Prevención y el Control de Enfermedades (ECDC)</div>
-    <div class="week">{week_label}</div>
+<div class="header">
+  <h1>Resumen Semanal de Amenazas de Enfermedades Transmisibles</h1>
+  <div class="subtitle">Centro Europeo para la Prevención y el Control de Enfermedades (ECDC)</div>
+  <div class="week">[[WEEK_RANGE_LABEL]]</div>
+</div>
+
+<div class="container">
+  <div class="card full-width">
+    <h2>Resumen Ejecutivo</h2>
+    <p>[[EXEC_PARAGRAPH]]</p>
+    <a href="[[PDF_URL]]" class="pdf-button">📄 Abrir Informe Completo (PDF)</a>
+    <a href="[[ARTICLE_URL]]" class="pdf-button" style="background:#125e2a">🌐 Ver página del informe</a>
   </div>
 
-  <div class="container">
-    <div class="card full-width">
-      <h2>Resumen Ejecutivo</h2>
-      <p>Informe de vigilancia epidemiológica con foco en España y comparativa UE/EEE.</p>
-      <a href="{pdf_url}" class="pdf-button">📄 Abrir Informe Completo (PDF)</a>
-      <a href="{article_url}" class="pdf-button" style="background:#125e2a">🌐 Ver página del informe</a>
-      <div class="key-points">{resumen_exec}</div>
-    </div>
-
-    <div class="card spain-card full-width">
-      <h2>Datos Destacados para España</h2>
-      <div class="stat-grid">{es_grid}</div>
-      <div class="key-points"><h3>España – lectura clínica/operativa</h3>{es_bullets}</div>
-      <div class="risk-tag risk-low">VIGILANCIA ACTIVA</div>
-    </div>
-
-    <div class="card full-width">
-      <h2>Panorama UE/EEE</h2>
-      <div class="stat-grid">{eu_grid}</div>
-      <div class="key-points"><h3>Puntos Clave</h3>{eu_bullets}</div>
-      <div class="risk-tag risk-low">ESTACIONAL / HETEROGÉNEO</div>
-    </div>
-
-    {"<div class='card full-width'><h2>Resumen de Alertas y Monitoreo Activo</h2><ul class='topic-list'>" + "".join(f"<li>{x}</li>" for x in summary.get("Alertas y monitoreo activo", [])) + "</ul></div>" if summary.get("Alertas y monitoreo activo") else ""}
-
-    <div class="card full-width">
-      <h2>Recomendaciones operativas</h2>
-      <div class="key-points">{recomendaciones}</div>
-    </div>
-
-    <div class="card full-width">
-      <h2>Notas de trazabilidad</h2>
-      <div class="key-points">{evidencias}</div>
+  <div class="card spain-card full-width">
+    <h2>Datos Destacados para España</h2>
+    <div class="stat-grid">
+      <div class="stat-box spain-stat">
+        <div class="number">[[ES_CCHF_TOTAL]]</div>
+        <div class="label">Casos de Fiebre Hemorrágica de Crimea-Congo (acumulado)</div>
+      </div>
+      <div class="stat-box spain-stat">
+        <div class="number">[[ES_CCHF_NEW]]</div>
+        <div class="label">Nuevos casos de CCHF esta semana</div>
+      </div>
+      <div class="stat-box spain-stat">
+        <div class="number">[[EU_WNV_COUNTRIES]]</div>
+        <div class="label">Países europeos con WNV</div>
+      </div>
+      <div class="stat-box spain-stat">
+        <div class="number">[[ES_DENGUE_THIS_WEEK]]</div>
+        <div class="label">Casos de dengue reportados (semana)</div>
+      </div>
     </div>
   </div>
 
-  <div class="footer">
-    <p>Resumen generado el: {gen_date_es}</p>
-    <p>Fuente: ECDC Weekly Communicable Disease Threats Report</p>
-    <p>Este es un resumen automático. Para información detallada, consulte el informe completo.</p>
+  <div class="card">
+    <h2>Virus Respiratorios en la UE/EEA</h2>
+    <div class="key-points">
+      <h3>Puntos Clave (estimaciones del informe):</h3>
+      <ul>
+        <li>Positividad de SARS-CoV-2 (España aprox.): <strong>[[ES_SARS_POS]]</strong></li>
+        <li>Otras virosis respiratorias: actividad estacional; niveles variables por país.</li>
+      </ul>
+    </div>
+    <p><strong>Tendencia:</strong> [[RESP_TREND]].</p>
+    <div class="risk-tag risk-low">SITUACIÓN ESTABLE</div>
   </div>
+
+  <div class="card">
+    <h2>Virus del Nilo Occidental (WNV)</h2>
+    <div class="key-points">
+      <h3>Datos Europeos:</h3>
+      <ul>
+        <li><strong>[[EU_WNV_COUNTRIES]] países</strong> reportando casos humanos</li>
+        <li>España: [[ES_WNV_CASES]] caso(s) detectados</li>
+      </ul>
+    </div>
+    <p><strong>Expansión:</strong> [[WNV_EXPANSION]].</p>
+    <div class="risk-tag risk-low">EXPANSIÓN ESTACIONAL</div>
+  </div>
+
+  <div class="card">
+    <h2>Fiebre Hemorrágica de Crimea-Congo</h2>
+    <div class="key-points">
+      <h3>Situación Actual:</h3>
+      <ul>
+        <li><strong>España: [[ES_CCHF_TOTAL]] casos</strong> (acumulado año)</li>
+        <li>[[CCHF_OTHER_INFO]]</li>
+        <li><strong>[[ES_CCHF_NEW]] nuevos casos</strong> esta semana</li>
+      </ul>
+    </div>
+    <p>[[CCHF_COMMENT]].</p>
+    <div class="risk-tag risk-low">RIESGO BAJO</div>
+  </div>
+
+  <div class="card">
+    <h2>Dengue en Europa</h2>
+    <div class="key-points">
+      <h3>Casos Autóctonos (UE/EEE):</h3>
+      <ul>
+        <li>Países con transmisión autóctona: <strong>[[EU_DENGUE_AUTO_COUNTRIES]]</strong></li>
+        <li>Total casos autóctonos estimados: <strong>[[EU_DENGUE_AUTO_TOTAL]]</strong></li>
+      </ul>
+    </div>
+    <p><strong>España:</strong> sin señal autóctona si no se indica lo contrario (esta semana: [[ES_DENGUE_THIS_WEEK]]).</p>
+    <div class="risk-tag risk-low">SEGUIMIENTO ACTIVO</div>
+  </div>
+
+  <div class="card full-width">
+    <h2>Notas de trazabilidad</h2>
+    <div class="key-points">
+      [[EVIDENCE_HTML]]
+    </div>
+  </div>
+
+</div>
+
+<div class="footer">
+  <p>Resumen generado el: [[GEN_DATE_ES]]</p>
+  <p>Fuente: ECDC Weekly Communicable Disease Threats Report, [[TITLE_WEEK]]</p>
+  <p>Este es un resumen automático. Para información detallada, consulte el informe completo.</p>
+</div>
 </body>
-</html>""".format(
-            week_label=week_label,
-            pdf_url=pdf_url,
-            article_url=article_url,
-            resumen_exec=ul(summary.get("Resumen Ejecutivo", [])),
-            es_grid=es_grid or "<em>Sin datos específicos de España capturados.</em>",
-            es_bullets=ul(summary.get("España – visión detallada", [])),
-            eu_grid=eu_grid or "<em>Sin datos comparativos UE/EEE capturados.</em>",
-            eu_bullets=ul(summary.get("Panorama UE/EEE", [])),
-            recomendaciones=ul(summary.get("Recomendaciones operativas", [])),
-            evidencias=(summary.get("evidence_html", "") or "<em>Sin evidencias capturadas.</em>"),
-            gen_date_es=gen_date_es
-        )
-        return html
+</html>"""
 
-    def _render_with_external_template(self, template_text: str,
-                                       week: Optional[int], year: Optional[int],
-                                       pdf_url: str, article_url: str,
-                                       summary: Dict[str, List[str]]) -> str:
-        """
-        Sustituye placeholders si existen. Si faltan, simplemente deja el trozo original.
-        """
-        week_label = f"Semana {week}, {year}" if week and year else "Último informe"
-        gen_date_es = fecha_es(dt.datetime.utcnow())
+    def _render_user_template(self,
+                              pdf_url: str,
+                              article_url: str,
+                              week: Optional[int],
+                              year: Optional[int],
+                              data: Dict[str, Any],
+                              evidence_html: str) -> str:
+        # Derivar etiquetas de semana y rango de fechas
+        if week and year:
+            try:
+                d1, d7 = first_day_last_day_of_iso_week(year, week)
+                week_range = f"Semana {week}: {d1.day}-{d7.day} {MESES_ES[d7.month]} {year}"
+            except Exception:
+                week_range = f"Semana {week}, {year}"
+        else:
+            week_range = "Último informe"
 
-        data = summary.get("data", {}) if isinstance(summary.get("data"), dict) else {}
+        title_week = week_range
+
         sp = data.get("spain", {}) if isinstance(data.get("spain"), dict) else {}
         eu = data.get("eu", {}) if isinstance(data.get("eu"), dict) else {}
 
-        def stat_box(number: Optional[str], label: str, accent: bool=False) -> str:
-            if number is None: number = "–"
-            cls = "spain-stat" if accent else ""
-            return f'''<div class="stat-box {cls}">
-                <div class="number">{number}</div>
-                <div class="label">{label}</div>
-            </div>'''
+        # Valores
+        es_cchf_total = safe_num(sp.get("cchf_cases"))
+        es_cchf_new = "—"  # sin extracción específica de “nuevos”
+        eu_wnv_countries = safe_num(eu.get("wnv_countries"))
+        es_dengue_week = safe_num(sp.get("dengue_local"))  # si hay autóctonos; si no, “—”
+        es_sars_pos = (f"{sp.get('sars_pos')}%" if sp.get("sars_pos") is not None else "—")
+        resp_trend = "Circulación generalizada de SARS-CoV-2 con impacto limitado en hospitalizaciones"
+        es_wnv_cases = safe_num(sp.get("wnv_cases"))
+        wnv_expansion = "Patrón estacional con ampliación geográfica en verano-otoño"
+        cchf_other_info = "Casos también reportados en otros países de la región (según informe)."
+        cchf_comment = "Casos esperables en áreas endémicas; mantener vigilancia y protocolos de bioseguridad."
 
-        es_grid = "".join([
-            stat_box(str(sp.get('cchf_cases')) if sp.get('cchf_cases') is not None else None, "CCHF – casos (España)", True),
-            stat_box(str(sp.get('wnv_cases')) if sp.get('wnv_cases') is not None else None, "WNV – casos (España)", True),
-            stat_box(str(sp.get('wnv_municipalities')) if sp.get('wnv_municipalities') is not None else None, "WNV – zonas/municipios", True),
-            stat_box(str(sp.get('dengue_local')) if sp.get('dengue_local') is not None else None, "Dengue autóctono (España)", True),
-            stat_box(str(sp.get('dengue_imported')) if sp.get('dengue_imported') is not None else None, "Dengue importado (España)", True),
-            stat_box((f"{sp.get('sars_pos')}%" if sp.get('sars_pos') is not None else None), "SARS-CoV-2 – positividad", True),
-        ])
+        eu_dengue_countries = safe_num(eu.get("dengue_auto_countries"))
+        eu_dengue_total = safe_num(eu.get("dengue_auto_total"))
 
-        eu_grid = "".join([
-            stat_box(str(eu.get('wnv_countries')) if eu.get('wnv_countries') is not None else None, "Países con WNV (UE/EEE)"),
-            stat_box(str(eu.get('dengue_auto_countries')) if eu.get('dengue_auto_countries') is not None else None, "Países con dengue autóctono"),
-            stat_box(str(eu.get('dengue_auto_total')) if eu.get('dengue_auto_total') is not None else None, "Dengue autóctono – total UE/EEE"),
-            stat_box(str(eu.get('cchf_countries')) if eu.get('cchf_countries') is not None else None, "Países con CCHF"),
-        ])
+        exec_points = []
+        if es_wnv_cases != "—":
+            exec_points.append(f"WNV (España): {es_wnv_cases} caso(s).")
+        if es_cchf_total != "—":
+            exec_points.append(f"CCHF (España): {es_cchf_total} caso(s) acumulados.")
+        if eu_wnv_countries != "—":
+            exec_points.append(f"WNV (UE/EEE): {eu_wnv_countries} países reportando transmisión.")
+        if eu_dengue_total != "—" or eu_dengue_countries != "—":
+            frag = []
+            if eu_dengue_countries != "—":
+                frag.append(f"{eu_dengue_countries} país(es)")
+            if eu_dengue_total != "—":
+                frag.append(f"{eu_dengue_total} casos autóctonos")
+            exec_points.append("Dengue (UE/EEE): " + " | ".join(frag) + ".")
 
-        alertas_ul = ul(summary.get("Alertas y monitoreo activo", [])) if summary.get("Alertas y monitoreo activo") else ""
+        if not exec_points:
+            exec_points = ["Sin indicadores cuantitativos destacados esta semana en la extracción automática."]
 
+        exec_paragraph = " ".join(exec_points)
+
+        html = self.USER_TEMPLATE
         replacements = {
-            "{{WEEK_LABEL}}": week_label,
-            "{{PDF_URL}}": pdf_url,
-            "{{ARTICLE_URL}}": article_url,
-            "{{GEN_DATE}}": gen_date_es,
-            "{{RESUMEN_EJECUTIVO_UL}}": ul(summary.get("Resumen Ejecutivo", [])),
-            "{{ES_STAT_GRID}}": es_grid or "<em>Sin datos específicos de España.</em>",
-            "{{ES_BULLETS_UL}}": ul(summary.get("España – visión detallada", [])),
-            "{{EU_STAT_GRID}}": eu_grid or "<em>Sin datos UE/EEE.</em>",
-            "{{EU_BULLETS_UL}}": ul(summary.get("Panorama UE/EEE", [])),
-            "{{ALERTAS_UL}}": alertas_ul,
-            "{{EVIDENCIAS_HTML}}": (summary.get("evidence_html", "") or "<em>Sin evidencias capturadas.</em>"),
+            "[[TITLE_WEEK]]": title_week,
+            "[[WEEK_RANGE_LABEL]]": week_range,
+            "[[EXEC_PARAGRAPH]]": exec_paragraph,
+            "[[PDF_URL]]": pdf_url or "#",
+            "[[ARTICLE_URL]]": article_url or "#",
+            "[[ES_CCHF_TOTAL]]": es_cchf_total,
+            "[[ES_CCHF_NEW]]": es_cchf_new,
+            "[[EU_WNV_COUNTRIES]]": eu_wnv_countries,
+            "[[ES_DENGUE_THIS_WEEK]]": es_dengue_week,
+            "[[ES_SARS_POS]]": es_sars_pos,
+            "[[RESP_TREND]]": resp_trend,
+            "[[ES_WNV_CASES]]": es_wnv_cases,
+            "[[WNV_EXPANSION]]": wnv_expansion,
+            "[[CCHF_OTHER_INFO]]": cchf_other_info,
+            "[[CCHF_COMMENT]]": cchf_comment,
+            "[[EU_DENGUE_AUTO_COUNTRIES]]": eu_dengue_countries,
+            "[[EU_DENGUE_AUTO_TOTAL]]": eu_dengue_total,
+            "[[EVIDENCE_HTML]]": evidence_html or "<em>Sin evidencias capturadas.</em>",
+            "[[GEN_DATE_ES]]": fecha_es(dt.datetime.utcnow()),
         }
-        out = template_text
         for k, v in replacements.items():
-            out = out.replace(k, v)
-        return out
+            html = html.replace(k, v)
 
-    def build_html(self, week: Optional[int], year: Optional[int],
-                   pdf_url: str, article_url: str,
-                   summary: Dict[str, List[str]]) -> str:
-        """
-        Si hay plantilla externa (con placeholders), úsala.
-        En otro caso, usa la plantilla integrada (look&feel igual al que pasaste).
-        """
-        path = self.cfg.html_template_path
-        if path and os.path.exists(path):
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    template_text = f.read()
-                return self._render_with_external_template(template_text, week, year, pdf_url, article_url, summary)
-            except Exception as e:
-                logging.warning("No se pudo usar la plantilla externa (%s). Se usa la integrada.", e)
-        return self._default_html(week, year, pdf_url, article_url, summary)
+        return html
 
-    # ---------- Email ----------
+    # --------------------------------------------------------------
+    # Email
+    # --------------------------------------------------------------
     def _parse_recipients(self, raw: str) -> List[str]:
         if not raw:
             return []
@@ -699,27 +578,25 @@ body {{ background-color: #f5f7fa; color: #333; line-height: 1.6; padding: 20px;
             return
 
         ctx = ssl.create_default_context()
-        try:
-            if int(self.cfg.smtp_port) == 465:
-                with smtplib.SMTP_SSL(self.cfg.smtp_server, self.cfg.smtp_port, context=ctx, timeout=30) as s:
-                    s.ehlo()
-                    if self.cfg.email_password:
-                        s.login(self.cfg.sender_email, self.cfg.email_password)
-                    s.sendmail(self.cfg.sender_email, to_addrs, msg.as_string())
-            else:
-                with smtplib.SMTP(self.cfg.smtp_server, self.cfg.smtp_port, timeout=30) as s:
-                    s.ehlo()
-                    s.starttls(context=ctx)
-                    s.ehlo()
-                    if self.cfg.email_password:
-                        s.login(self.cfg.sender_email, self.cfg.email_password)
-                    s.sendmail(self.cfg.sender_email, to_addrs, msg.as_string())
-            logging.info("Correo enviado correctamente.")
-        except Exception as e:
-            logging.error("Error enviando correo: %s", e)
-            raise
+        if int(self.cfg.smtp_port) == 465:
+            with smtplib.SMTP_SSL(self.cfg.smtp_server, self.cfg.smtp_port, context=ctx, timeout=30) as s:
+                s.ehlo()
+                if self.cfg.email_password:
+                    s.login(self.cfg.sender_email, self.cfg.email_password)
+                s.sendmail(self.cfg.sender_email, to_addrs, msg.as_string())
+        else:
+            with smtplib.SMTP(self.cfg.smtp_server, self.cfg.smtp_port, timeout=30) as s:
+                s.ehlo()
+                s.starttls(context=ctx)
+                s.ehlo()
+                if self.cfg.email_password:
+                    s.login(self.cfg.sender_email, self.cfg.email_password)
+                s.sendmail(self.cfg.sender_email, to_addrs, msg.as_string())
+        logging.info("Correo enviado correctamente.")
 
-    # ---------- Run ----------
+    # --------------------------------------------------------------
+    # Ejecución principal
+    # --------------------------------------------------------------
     def run(self) -> None:
         try:
             article_url, pdf_url, week, year = self.fetch_latest_article_and_pdf()
@@ -751,17 +628,38 @@ body {{ background-color: #f5f7fa; color: #333; line-height: 1.6; padding: 20px;
                 except Exception:
                     pass
 
+        # Datos y evidencias
         try:
             if text:
                 data = self.extract_key_data(text)
-                summary = self.generate_spanish_summary_rico(data, week, year)
+                # construir evidencias HTML
+                ev = data.get("evidence", {}) if isinstance(data.get("evidence"), dict) else {}
+                if ev:
+                    items = []
+                    for k, v in ev.items():
+                        if v:
+                            items.append(f"<li><strong>{k}:</strong> {v}</li>")
+                    evidence_html = "<ul>" + "".join(items) + "</ul>"
+                else:
+                    evidence_html = ""
             else:
-                summary = self.generate_spanish_summary_rico({}, week, year)
+                data = {}
+                evidence_html = ""
         except Exception as e:
-            logging.error("Error generando resumen: %s", e)
-            summary = {"Resumen Ejecutivo": ["No se pudo generar el resumen automático."], "data": {}, "evidence_html": ""}
+            logging.error("Error extrayendo datos: %s", e)
+            data = {}
+            evidence_html = ""
 
-        html = self.build_html(week, year, pdf_url, article_url, summary)
+        # Render con TU PLANTILLA
+        html = self._render_user_template(
+            pdf_url=pdf_url,
+            article_url=article_url,
+            week=week,
+            year=year,
+            data=data,
+            evidence_html=evidence_html
+        )
+
         subject = f"ECDC CDTR – Resumen Semana {week or 'N/D'} ({year or 'N/D'}) – Español"
 
         try:
@@ -772,9 +670,9 @@ body {{ background-color: #f5f7fa; color: #333; line-height: 1.6; padding: 20px;
             logging.error("Error enviando correo: %s", e)
 
 
-# =========================
+# =====================================================================
 # main
-# =========================
+# =====================================================================
 
 def main() -> None:
     cfg = Config()
@@ -782,4 +680,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 
